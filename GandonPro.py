@@ -416,6 +416,7 @@ class BasicBlockItem(QGraphicsRectItem):
 
     def contextMenuEvent(self, event):
         menu = QMenu()
+        act_decompile = menu.addAction("View Pseudocode (F5)")
         act_rename = menu.addAction("Rename Label (N)")
         act_comment = menu.addAction("Add Comment (;)")
         act_sig = menu.addAction("Generate SigMaker Pattern (Ctrl+B)")
@@ -427,7 +428,9 @@ class BasicBlockItem(QGraphicsRectItem):
         act_c_blue = col_menu.addAction("Info (Blue)")
 
         action = menu.exec(event.screenPos())
-        if action == act_rename:
+        if action == act_decompile:
+            self.main_window.action_decompile_pseudocode()
+        elif action == act_rename:
             self.main_window.action_rename_node()
         elif action == act_comment:
             self.main_window.action_add_comment()
@@ -667,6 +670,118 @@ class FlatDisasmWidget(QWidget):
                 comm_str = f" ; {c}" if c else ""
                 lines.append(f"    {mnem:<8} {op:<30}{comm_str}")
             lines.append("")
+        self.editor.setPlainText("\n".join(lines))
+
+
+# =====================================================================
+#                 PSEUDOCODE DECOMPILER VIEW (F5 KEY)
+# =====================================================================
+
+class PseudocodeWidget(QWidget):
+    def __init__(self, main_window):
+        super().__init__()
+        self.main_window = main_window
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.editor = QPlainTextEdit()
+        self.editor.setReadOnly(True)
+        self.editor.setFont(QFont("Consolas", 10))
+        self.editor.setStyleSheet("""
+            QPlainTextEdit {
+                background-color: #1e1e1e;
+                color: #d4d4d4;
+                border: none;
+                font-family: Consolas, monospace;
+            }
+        """)
+        layout.addWidget(self.editor)
+
+    def decompile(self, blocks, start_va):
+        if not blocks:
+            self.editor.setPlainText("// No active function to decompile.")
+            return
+
+        func_name = self.main_window.custom_names.get(start_va, f"sub_{start_va:08X}")
+        lines = []
+        lines.append(f"// ==========================================================================")
+        lines.append(f"// Decompiled by Gandon-PRO Pseudocode Engine (Architecture: x86-64)")
+        lines.append(f"// Function Entry: 0x{start_va:08X} - {func_name}")
+        lines.append(f"// ==========================================================================\n")
+        lines.append(f"__int64 __fastcall {func_name}(__int64 a1, __int64 a2, __int64 a3, __int64 a4)")
+        lines.append("{")
+        lines.append("    __int64 result = 0;")
+        lines.append("    __int64 v0, v1, v2, v3;")
+        lines.append("    unsigned __int64 v_ret = 0;\n")
+
+        cond_map = {
+            "je": "==", "jz": "==", "jne": "!=", "jnz": "!=",
+            "jg": ">", "jge": ">=", "jl": "<", "jle": "<=",
+            "ja": ">", "jae": ">=", "jb": "<", "jbe": "<="
+        }
+
+        last_cmp = ("v0", "0", "==")
+
+        for addr in sorted(blocks.keys()):
+            b_name = self.main_window.custom_names.get(addr, f"loc_{addr:08X}")
+            comm = self.main_window.custom_comments.get(addr, "")
+            lines.append(f" {b_name}:" + (f" // {comm}" if comm else ""))
+
+            for mnem, op, c in blocks[addr]:
+                parts = [p.strip() for p in op.split(",")] if op else []
+
+                if mnem in ("mov", "movsxd", "movzx"):
+                    if len(parts) == 2:
+                        dst = parts[0].replace("dword ptr ", "").replace("qword ptr ", "")
+                        src = parts[1]
+                        lines.append(f"    {dst} = {src};" + (f" // {c}" if c else ""))
+
+                elif mnem == "lea":
+                    if len(parts) == 2:
+                        dst = parts[0]
+                        src = parts[1].replace("[", "&(").replace("]", ")")
+                        lines.append(f"    {dst} = {src};" + (f" // {c}" if c else ""))
+
+                elif mnem in ("add", "sub", "xor", "and", "or", "shl", "shr"):
+                    op_sym = {"add": "+=", "sub": "-=", "xor": "^=", "and": "&=", "or": "|=", "shl": "<<=", "shr": ">>="}[mnem]
+                    if len(parts) == 2:
+                        lines.append(f"    {parts[0]} {op_sym} {parts[1]};")
+
+                elif mnem == "cmp" or mnem == "test":
+                    if len(parts) == 2:
+                        last_cmp = (parts[0], parts[1], "==" if mnem == "test" else "==")
+
+                elif mnem.startswith("j") and mnem != "jmp":
+                    cond_op = cond_map.get(mnem, "!=")
+                    target = parts[0] if parts else "loc_???"
+                    try:
+                        t_val = int(target, 16)
+                        t_lbl = self.main_window.custom_names.get(t_val, f"loc_{t_val:08X}")
+                    except ValueError:
+                        t_lbl = target
+                    lines.append(f"    if ({last_cmp[0]} {cond_op} {last_cmp[1]})")
+                    lines.append(f"        goto {t_lbl};")
+
+                elif mnem == "jmp":
+                    target = parts[0] if parts else "loc_???"
+                    try:
+                        t_val = int(target, 16)
+                        t_lbl = self.main_window.custom_names.get(t_val, f"loc_{t_val:08X}")
+                    except ValueError:
+                        t_lbl = target
+                    lines.append(f"    goto {t_lbl};")
+
+                elif mnem == "call":
+                    target = parts[0] if parts else "sub_???"
+                    call_label = f"/* {c} */" if c else ""
+                    lines.append(f"    result = ((__int64 (*)(...)){target})({call_label});")
+
+                elif mnem == "ret":
+                    lines.append("    return result;")
+
+            lines.append("")
+
+        lines.append("    return result;")
+        lines.append("}")
         self.editor.setPlainText("\n".join(lines))
 
 
@@ -913,6 +1028,7 @@ class GandonPRO(QMainWindow):
         file_menu.addAction(save_db_act)
 
         load_db_act = QAction("Load Database (.gnd)...", self)
+        load_db_act.setShortcut(QKeySequence("Ctrl+S"))
         load_db_act.triggered.connect(self.load_database)
         file_menu.addAction(load_db_act)
 
@@ -958,6 +1074,11 @@ class GandonPRO(QMainWindow):
         jump_menu.addAction(xrefs_act)
 
         tools_menu = menubar.addMenu("Tools")
+        decompile_act = QAction("Decompile to Pseudocode", self)
+        decompile_act.setShortcut(QKeySequence("F5"))
+        decompile_act.triggered.connect(self.action_decompile_pseudocode)
+        tools_menu.addAction(decompile_act)
+
         sig_act = QAction("SigMaker: Generate Gandon Signature", self)
         sig_act.setShortcut(QKeySequence("Ctrl+B"))
         sig_act.triggered.connect(self.action_generate_signature)
@@ -983,25 +1104,29 @@ class GandonPRO(QMainWindow):
         act_flat.triggered.connect(lambda: self.tab_widget.setCurrentIndex(1))
         view_menu.addAction(act_flat)
 
+        act_pseudo = QAction("Pseudocode-A (F5)", self)
+        act_pseudo.triggered.connect(self.action_decompile_pseudocode)
+        view_menu.addAction(act_pseudo)
+
         act_hex = QAction("Hex View-1", self)
-        act_hex.triggered.connect(lambda: self.tab_widget.setCurrentIndex(2))
+        act_hex.triggered.connect(lambda: self.tab_widget.setCurrentIndex(3))
         view_menu.addAction(act_hex)
 
         act_types = QAction("Local Types", self)
-        act_types.triggered.connect(lambda: self.tab_widget.setCurrentIndex(3))
+        act_types.triggered.connect(lambda: self.tab_widget.setCurrentIndex(4))
         view_menu.addAction(act_types)
 
         act_imports = QAction("Imports", self)
-        act_imports.triggered.connect(lambda: self.tab_widget.setCurrentIndex(4))
+        act_imports.triggered.connect(lambda: self.tab_widget.setCurrentIndex(5))
         view_menu.addAction(act_imports)
 
         act_exports = QAction("Exports", self)
-        act_exports.triggered.connect(lambda: self.tab_widget.setCurrentIndex(5))
+        act_exports.triggered.connect(lambda: self.tab_widget.setCurrentIndex(6))
         view_menu.addAction(act_exports)
 
         act_strings = QAction("Strings", self)
         act_strings.setShortcut(QKeySequence("Shift+F12"))
-        act_strings.triggered.connect(lambda: self.tab_widget.setCurrentIndex(6))
+        act_strings.triggered.connect(lambda: self.tab_widget.setCurrentIndex(7))
         view_menu.addAction(act_strings)
 
         help_menu = menubar.addMenu("Help")
@@ -1036,6 +1161,9 @@ class GandonPRO(QMainWindow):
         self.flat_view = FlatDisasmWidget(self)
         self.tab_widget.addTab(self.flat_view, "Gandon Text Listing")
 
+        self.pseudocode_view = PseudocodeWidget(self)
+        self.tab_widget.addTab(self.pseudocode_view, "Pseudocode-A")
+
         self.hex_view = HexViewWidget(self)
         self.tab_widget.addTab(self.hex_view, "Hex View-1")
 
@@ -1059,7 +1187,7 @@ class GandonPRO(QMainWindow):
         self.setCentralWidget(self.main_splitter)
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("Ready. Shortcuts: X (XREFs), Ctrl+B (SigMaker), Space (Switch), G (Jump), N (Rename), ; (Comment)")
+        self.status_bar.showMessage("Ready. Shortcuts: F5 (Pseudocode), X (XREFs), Ctrl+B (SigMaker), Space (Switch), G (Jump)")
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1113,6 +1241,11 @@ class GandonPRO(QMainWindow):
     # =====================================================================
     #                         ДЕЙСТВИЯ И ХОТКЕИ
     # =====================================================================
+
+    def action_decompile_pseudocode(self):
+        # Хоткей F5: Переключение на псевдокод
+        self.pseudocode_view.decompile(self.blocks, self.current_va)
+        self.tab_widget.setCurrentIndex(2)
 
     def toggle_graph_flat_view(self):
         curr = self.tab_widget.currentIndex()
@@ -1401,6 +1534,7 @@ class GandonPRO(QMainWindow):
             for node in self.graph_view.nodes.values():
                 node.update_content()
             self.flat_view.populate(self.blocks)
+            self.pseudocode_view.decompile(self.blocks, self.current_va)
             self.status_bar.showMessage("Database loaded.")
 
     # =====================================================================
@@ -1626,6 +1760,7 @@ class GandonPRO(QMainWindow):
             self.graph_view.add_edge(src, dst, col, e_type)
 
         self.flat_view.populate(self.blocks)
+        self.pseudocode_view.decompile(self.blocks, start_va)
 
         if start_va in self.graph_view.nodes:
             self.graph_view.centerOn(self.graph_view.nodes[start_va])
