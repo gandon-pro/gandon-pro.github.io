@@ -1,2 +1,2 @@
-# gandon-pro.github.io
+Gandon-PRO
 Gandon: The Interactive Disassembler
