@@ -5,7 +5,7 @@ import json
 import urllib.request
 import pefile
 from capstone import Cs, CS_ARCH_X86, CS_MODE_64, CS_MODE_32
-from capstone.x86 import X86_GRP_JUMP, X86_GRP_CALL, X86_GRP_RET
+from capstone.x86 import X86_GRP_JUMP, X86_GRP_CALL, X86_GRP_RET, X86_OP_MEM, X86_REG_RIP
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit,
@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QSplitter, QStatusBar, QTabWidget,
     QPlainTextEdit, QGraphicsView, QGraphicsScene, QGraphicsRectItem,
     QGraphicsTextItem, QGraphicsItem, QGraphicsPathItem, QGraphicsPolygonItem,
-    QDialog, QLabel, QPushButton, QInputDialog, QMessageBox
+    QDialog, QLabel, QPushButton, QInputDialog, QMessageBox, QMenu
 )
 from PyQt6.QtGui import (
     QFont, QColor, QAction, QKeySequence, QPen, QBrush,
@@ -29,7 +29,7 @@ from PyQt6.QtCore import Qt, QRectF, QPointF
 class AboutDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("About")
+        self.setWindowTitle("About Gandon-PRO")
         self.setFixedSize(520, 220)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint)
 
@@ -135,7 +135,7 @@ class XrefsDialog(QDialog):
     def __init__(self, target_name, xrefs, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"xrefs to {target_name}")
-        self.resize(580, 320)
+        self.resize(640, 360)
         self.target_address = None
 
         layout = QVBoxLayout(self)
@@ -143,7 +143,7 @@ class XrefsDialog(QDialog):
 
         self.table = QTableWidget()
         self.table.setColumnCount(3)
-        self.table.setHorizontalHeaderLabels(["Direction", "Type", "Address / Instruction"])
+        self.table.setHorizontalHeaderLabels(["Direction", "Type", "Address / Target"])
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.table.verticalHeader().setVisible(False)
         self.table.setFont(QFont("Consolas", 9))
@@ -166,7 +166,7 @@ class XrefsDialog(QDialog):
         btn_box.addStretch()
         jump_btn = QPushButton("Jump")
         jump_btn.clicked.connect(self.on_select_btn)
-        jump_btn.setStyleSheet("background-color: #007acc; color: white; padding: 4px 14px; border: none; border-radius: 2px;")
+        jump_btn.setStyleSheet("background-color: #007acc; color: white; padding: 5px 16px; border: none; border-radius: 2px;")
         btn_box.addWidget(jump_btn)
         layout.addLayout(btn_box)
 
@@ -183,6 +183,49 @@ class XrefsDialog(QDialog):
         if row >= 0:
             self.target_address = self.xrefs_data[row][2]
             self.accept()
+
+
+# =====================================================================
+#             SIGMAKER DIALOG (SIGNATURE GENERATOR)
+# =====================================================================
+
+class SigMakerDialog(QDialog):
+    def __init__(self, sig_gandon, sig_cpp_mask, count_matches, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Signature Generator (SigMaker)")
+        self.resize(600, 240)
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel(f"<b>Uniqueness Status:</b> {'UNIQUE (1 Match found)' if count_matches == 1 else f'Collisions: {count_matches} Matches'}"))
+
+        layout.addWidget(QLabel("Gandon Pattern:"))
+        self.gandon_edit = QLineEdit(sig_gandon)
+        self.gandon_edit.setReadOnly(True)
+        layout.addWidget(self.gandon_edit)
+
+        layout.addWidget(QLabel("C++ Pattern & Mask:"))
+        self.cpp_edit = QLineEdit(sig_cpp_mask)
+        self.cpp_edit.setReadOnly(True)
+        layout.addWidget(self.cpp_edit)
+
+        btn_box = QHBoxLayout()
+        btn_box.addStretch()
+        copy_btn = QPushButton("Copy Gandon Pattern")
+        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(sig_gandon))
+        btn_box.addWidget(copy_btn)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btn_box.addWidget(close_btn)
+
+        layout.addLayout(btn_box)
+        self.setStyleSheet("""
+            QDialog { background-color: #1e1e1e; color: #d4d4d4; }
+            QLabel { color: #d4d4d4; }
+            QLineEdit { background-color: #252526; color: #4EC9B0; border: 1px solid #3c3c3c; padding: 5px; font-family: Consolas; }
+            QPushButton { background-color: #333; color: white; border: 1px solid #555; padding: 5px 12px; }
+            QPushButton:hover { background-color: #007acc; }
+        """)
 
 
 # =====================================================================
@@ -327,10 +370,14 @@ class BasicBlockItem(QGraphicsRectItem):
 
         self.update_content()
         self.setPen(QPen(QColor("#454545"), 1.5))
-        self.setBrush(QBrush(QColor("#252526")))
         self.setZValue(1)
 
+    def get_color(self):
+        hex_c = self.main_window.custom_colors.get(self.addr, "#252526")
+        return QColor(hex_c)
+
     def update_content(self, highlight_token=""):
+        self.setBrush(QBrush(self.get_color()))
         name = self.main_window.custom_names.get(self.addr, f"loc_{self.addr:08X}")
         user_comment = self.main_window.custom_comments.get(self.addr, "")
 
@@ -366,6 +413,40 @@ class BasicBlockItem(QGraphicsRectItem):
 
     def add_outgoing_edge(self, edge):
         self.outgoing_edges.append(edge)
+
+    def contextMenuEvent(self, event):
+        menu = QMenu()
+        act_rename = menu.addAction("Rename Label (N)")
+        act_comment = menu.addAction("Add Comment (;)")
+        act_sig = menu.addAction("Generate SigMaker Pattern (Ctrl+B)")
+        act_nop = menu.addAction("NOP Entire Block")
+        col_menu = menu.addMenu("Set Color Tag")
+        act_c_default = col_menu.addAction("Default Dark")
+        act_c_green = col_menu.addAction("Success / True (Green)")
+        act_c_red = col_menu.addAction("Failure / Detection (Red)")
+        act_c_blue = col_menu.addAction("Info (Blue)")
+
+        action = menu.exec(event.screenPos())
+        if action == act_rename:
+            self.main_window.action_rename_node()
+        elif action == act_comment:
+            self.main_window.action_add_comment()
+        elif action == act_sig:
+            self.main_window.action_generate_signature()
+        elif action == act_nop:
+            self.main_window.action_patch_nop()
+        elif action == act_c_default:
+            self.main_window.custom_colors.pop(self.addr, None)
+            self.update_content()
+        elif action == act_c_green:
+            self.main_window.custom_colors[self.addr] = "#1e3a29"
+            self.update_content()
+        elif action == act_c_red:
+            self.main_window.custom_colors[self.addr] = "#3d1f1f"
+            self.update_content()
+        elif action == act_c_blue:
+            self.main_window.custom_colors[self.addr] = "#1e2c3d"
+            self.update_content()
 
     def mouseDoubleClickEvent(self, event):
         for mnem, op, _ in self.instructions:
@@ -420,11 +501,13 @@ class GraphView(QGraphicsView):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.RightButton:
-            self.is_panning = True
-            self.pan_start_pos = event.pos()
-            self.setCursor(Qt.CursorShape.ClosedHandCursor)
-            event.accept()
-            return
+            item = self.itemAt(event.pos())
+            if not isinstance(item, BasicBlockItem):
+                self.is_panning = True
+                self.pan_start_pos = event.pos()
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                event.accept()
+                return
         elif event.button() == Qt.MouseButton.MiddleButton:
             self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         else:
@@ -810,6 +893,7 @@ class GandonPRO(QMainWindow):
 
         self.custom_names = {}
         self.custom_comments = {}
+        self.custom_colors = {}
 
         self.init_ui()
         self.apply_dark_theme()
@@ -817,7 +901,6 @@ class GandonPRO(QMainWindow):
     def init_ui(self):
         menubar = self.menuBar()
 
-        # Меню File
         file_menu = menubar.addMenu("File")
         open_act = QAction("Open PE File...", self)
         open_act.setShortcut(QKeySequence("Ctrl+O"))
@@ -842,7 +925,6 @@ class GandonPRO(QMainWindow):
         exit_act.triggered.connect(self.close)
         file_menu.addAction(exit_act)
 
-        # Меню Edit
         edit_menu = menubar.addMenu("Edit")
         rename_act = QAction("Rename Label", self)
         rename_act.setShortcut(QKeySequence("N"))
@@ -854,7 +936,11 @@ class GandonPRO(QMainWindow):
         comment_act.triggered.connect(self.action_add_comment)
         edit_menu.addAction(comment_act)
 
-        # Меню Jump
+        patch_nop_act = QAction("NOP Current Block", self)
+        patch_nop_act.setShortcut(QKeySequence("F2"))
+        patch_nop_act.triggered.connect(self.action_patch_nop)
+        edit_menu.addAction(patch_nop_act)
+
         jump_menu = menubar.addMenu("Jump")
         jump_act = QAction("Jump to Address / Label", self)
         jump_act.setShortcut(QKeySequence("G"))
@@ -871,7 +957,17 @@ class GandonPRO(QMainWindow):
         xrefs_act.triggered.connect(self.action_show_xrefs)
         jump_menu.addAction(xrefs_act)
 
-        # Меню View
+        tools_menu = menubar.addMenu("Tools")
+        sig_act = QAction("SigMaker: Generate Gandon Signature", self)
+        sig_act.setShortcut(QKeySequence("Ctrl+B"))
+        sig_act.triggered.connect(self.action_generate_signature)
+        tools_menu.addAction(sig_act)
+
+        search_sig_act = QAction("Search Gandon Signature Pattern...", self)
+        search_sig_act.setShortcut(QKeySequence("Ctrl+Shift+F"))
+        search_sig_act.triggered.connect(self.action_search_pattern)
+        tools_menu.addAction(search_sig_act)
+
         view_menu = menubar.addMenu("View")
         toggle_view_act = QAction("Switch Graph / Text Listing", self)
         toggle_view_act.setShortcut(QKeySequence(Qt.Key.Key_Space))
@@ -908,9 +1004,8 @@ class GandonPRO(QMainWindow):
         act_strings.triggered.connect(lambda: self.tab_widget.setCurrentIndex(6))
         view_menu.addAction(act_strings)
 
-        # Меню Help
         help_menu = menubar.addMenu("Help")
-        about_act = QAction("About...", self)
+        about_act = QAction("About Gandon-PRO...", self)
         about_act.triggered.connect(self.show_about_dialog)
         help_menu.addAction(about_act)
 
@@ -933,7 +1028,6 @@ class GandonPRO(QMainWindow):
         self.graph_view = GraphView(self)
         g_layout.addWidget(self.graph_view)
 
-        # Интерактивная мини-карта
         self.overview = GraphOverview(self.graph_view, self.graph_view)
         self.overview.move(15, 15)
 
@@ -965,7 +1059,7 @@ class GandonPRO(QMainWindow):
         self.setCentralWidget(self.main_splitter)
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("Ready. Shortcuts: Space (Switch), G (Jump), X (XREFs), N (Rename), ; (Comment)")
+        self.status_bar.showMessage("Ready. Shortcuts: X (XREFs), Ctrl+B (SigMaker), Space (Switch), G (Jump), N (Rename), ; (Comment)")
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1067,22 +1161,58 @@ class GandonPRO(QMainWindow):
 
     def action_show_xrefs(self):
         target_addr = None
+        current_node = None
+
         selected_nodes = self.graph_view.scene.selectedItems()
         for item in selected_nodes:
             if isinstance(item, BasicBlockItem):
-                target_addr = item.addr
+                current_node = item
+                cursor = item.text_item.textCursor()
+                if cursor.hasSelection():
+                    txt = cursor.selectedText().strip()
+                    for m in re.findall(r"0x[0-9a-fA-F]+", txt):
+                        try:
+                            target_addr = int(m, 16)
+                            break
+                        except ValueError:
+                            pass
+                if target_addr is None:
+                    target_addr = item.addr
                 break
 
         if target_addr is None:
             target_addr = self.current_va
 
         if not target_addr:
-            QMessageBox.information(self, "XREFs", "Select a block to inspect cross-references.")
+            QMessageBox.information(self, "XREFs", "No block or target selected for cross-references.")
             return
 
-        xrefs = self.xrefs_db.get(target_addr, [])
+        xrefs = list(self.xrefs_db.get(target_addr, []))
+
+        if current_node and current_node.addr == target_addr:
+            for mnem, op, comm in current_node.instructions:
+                for hex_m in re.findall(r"0x[0-9a-fA-F]+", op):
+                    try:
+                        dst_val = int(hex_m, 16)
+                        if dst_val != target_addr:
+                            xrefs.append(("Down", "Call/Jump", dst_val, f"{mnem} {op}"))
+                    except ValueError:
+                        pass
+
+        seen = set()
+        unique_xrefs = []
+        for x in xrefs:
+            key = (x[0], x[1], x[2])
+            if key not in seen:
+                seen.add(key)
+                unique_xrefs.append(x)
+
+        if not unique_xrefs:
+            QMessageBox.information(self, "XREFs", f"No cross-references found for 0x{target_addr:08X}.")
+            return
+
         name = self.custom_names.get(target_addr, f"loc_{target_addr:08X}")
-        dlg = XrefsDialog(name, xrefs, self)
+        dlg = XrefsDialog(name, unique_xrefs, self)
         if dlg.exec() and dlg.target_address:
             self.jump_to_address(dlg.target_address)
 
@@ -1108,6 +1238,130 @@ class GandonPRO(QMainWindow):
                     self.flat_view.populate(self.blocks)
                 return
 
+    def action_patch_nop(self):
+        for item in self.graph_view.scene.selectedItems():
+            if isinstance(item, BasicBlockItem):
+                try:
+                    offset = self.pe.get_offset_from_rva(item.addr - self.image_base)
+                    byte_arr = bytearray(self.pe.__data__)
+                    for i in range(min(15, len(item.instructions) * 3)):
+                        byte_arr[offset + i] = 0x90
+                    self.pe.__data__ = bytes(byte_arr)
+                    self.status_bar.showMessage(f"Patched block 0x{item.addr:08X} with NOPs")
+                    self.build_cfg_graph(self.current_va)
+                except Exception as e:
+                    QMessageBox.warning(self, "Patch Error", str(e))
+                return
+
+    def action_generate_signature(self):
+        selected_node = None
+        for item in self.graph_view.scene.selectedItems():
+            if isinstance(item, BasicBlockItem):
+                selected_node = item
+                break
+
+        if not selected_node or not self.pe:
+            QMessageBox.information(self, "SigMaker", "Select a block to generate a signature.")
+            return
+
+        try:
+            offset = self.pe.get_offset_from_rva(selected_node.addr - self.image_base)
+            raw = self.pe.__data__[offset: offset + 64]
+            disasm_list = list(self.cs.disasm(raw, selected_node.addr))
+        except Exception:
+            return
+
+        gandon_tokens = []
+        mask_chars = []
+        cpp_bytes = []
+
+        for insn in disasm_list[:6]:
+            b = insn.bytes
+            if insn.group(X86_GRP_JUMP) or insn.group(X86_GRP_CALL):
+                gandon_tokens.append(f"{b[0]:02X}")
+                mask_chars.append("x")
+                cpp_bytes.append(f"\\x{b[0]:02X}")
+                for _ in range(len(b) - 1):
+                    gandon_tokens.append("?")
+                    mask_chars.append("?")
+                    cpp_bytes.append("\\x00")
+            else:
+                for byte_val in b:
+                    gandon_tokens.append(f"{byte_val:02X}")
+                    mask_chars.append("x")
+                    cpp_bytes.append(f"\\x{byte_val:02X}")
+
+        sig_gandon = " ".join(gandon_tokens)
+        sig_cpp = f"\"{ ''.join(cpp_bytes) }\", \"{ ''.join(mask_chars) }\""
+
+        count_matches = self.count_pattern_matches(sig_gandon)
+        dlg = SigMakerDialog(sig_gandon, sig_cpp, count_matches, self)
+        dlg.exec()
+
+    def count_pattern_matches(self, pattern_str):
+        try:
+            regex_parts = []
+            for token in pattern_str.split():
+                if token == "?":
+                    regex_parts.append(b".")
+                else:
+                    regex_parts.append(re.escape(bytes.fromhex(token)))
+            reg = re.compile(b"".join(regex_parts), re.DOTALL)
+            return len(reg.findall(self.pe.__data__))
+        except Exception:
+            return 0
+
+    def action_search_pattern(self):
+        if not self.pe or not hasattr(self.pe, "__data__"):
+            QMessageBox.information(self, "Pattern Search", "Please load a binary file first.")
+            return
+
+        sig, ok = QInputDialog.getText(self, "Search Pattern", "Enter Gandon signature (e.g. 48 89 5C 24 ? 57 or single byte 01):")
+        if not (ok and sig.strip()):
+            return
+
+        raw_str = sig.strip()
+        if " " not in raw_str and "?" not in raw_str:
+            cleaned = "".join(c for c in raw_str if c in "0123456789abcdefABCDEF")
+            if len(cleaned) % 2 != 0:
+                cleaned = "0" + cleaned
+            tokens = [cleaned[i:i+2] for i in range(0, len(cleaned), 2)]
+        else:
+            tokens = raw_str.split()
+
+        regex_parts = []
+        for t in tokens:
+            if t == "?" or t == "??":
+                regex_parts.append(b".")
+            else:
+                hex_val = t.zfill(2) if len(t) == 1 else t
+                try:
+                    b_val = bytes.fromhex(hex_val)
+                    regex_parts.append(re.escape(b_val))
+                except ValueError:
+                    QMessageBox.warning(self, "Invalid Pattern", f"Invalid hex byte: '{t}'. Use values from 00 to FF or '?'.")
+                    return
+
+        if not regex_parts:
+            return
+
+        try:
+            reg = re.compile(b"".join(regex_parts), re.DOTALL)
+            match = reg.search(self.pe.__data__)
+            if match:
+                found_offset = match.start()
+                try:
+                    found_rva = self.pe.get_rva_from_offset(found_offset)
+                    target_va = self.image_base + found_rva
+                    self.jump_to_address(target_va)
+                    self.status_bar.showMessage(f"Pattern found at 0x{target_va:08X}")
+                except Exception:
+                    QMessageBox.warning(self, "Pattern Search", f"Pattern matched at raw file offset 0x{found_offset:X} (not inside a mapped section).")
+            else:
+                QMessageBox.information(self, "Pattern Search", "Pattern not found.")
+        except Exception as e:
+            QMessageBox.warning(self, "Search Error", str(e))
+
     def set_token_highlight(self, token):
         for node in self.graph_view.nodes.values():
             node.update_content(highlight_token=token)
@@ -1129,7 +1383,8 @@ class GandonPRO(QMainWindow):
         if file_path:
             db_data = {
                 "custom_names": {str(k): v for k, v in self.custom_names.items()},
-                "custom_comments": {str(k): v for k, v in self.custom_comments.items()}
+                "custom_comments": {str(k): v for k, v in self.custom_comments.items()},
+                "custom_colors": {str(k): v for k, v in self.custom_colors.items()}
             }
             with open(file_path, "w", encoding="utf-8") as f:
                 json.dump(db_data, f, indent=4)
@@ -1142,6 +1397,7 @@ class GandonPRO(QMainWindow):
                 db_data = json.load(f)
                 self.custom_names = {int(k): v for k, v in db_data.get("custom_names", {}).items()}
                 self.custom_comments = {int(k): v for k, v in db_data.get("custom_comments", {}).items()}
+                self.custom_colors = {int(k): v for k, v in db_data.get("custom_colors", {}).items()}
             for node in self.graph_view.nodes.values():
                 node.update_content()
             self.flat_view.populate(self.blocks)
@@ -1231,7 +1487,7 @@ class GandonPRO(QMainWindow):
         self.tab_widget.setCurrentIndex(0)
         self.jump_to_address(target_va)
 
-    def build_cfg_graph(self, start_va: int, max_depth: int = 30):
+    def build_cfg_graph(self, start_va: int, max_depth: int = 35):
         self.graph_view.clear_graph()
         if not self.pe or not self.cs:
             return
@@ -1270,23 +1526,31 @@ class GandonPRO(QMainWindow):
             for insn in disasm_iter:
                 op = insn.op_str
                 comment = ""
-                for hex_m in re.findall(r"0x[0-9a-fA-F]+", op):
-                    try:
-                        val = int(hex_m, 16)
-                        if val in self.string_lookup:
-                            comment = f'"{self.string_lookup[val]}"'
-                            break
-                    except ValueError:
-                        continue
+
+                for operand in insn.operands:
+                    if operand.type == X86_OP_MEM and operand.mem.base == X86_REG_RIP:
+                        resolved_va = insn.address + insn.size + operand.mem.disp
+                        if resolved_va in self.string_lookup:
+                            comment = f'"{self.string_lookup[resolved_va]}"'
+                        self.xrefs_db.setdefault(resolved_va, []).append(("Up", "Data Ref", insn.address, f"{insn.mnemonic} {op}"))
+
+                if not comment:
+                    for hex_m in re.findall(r"0x[0-9a-fA-F]+", op):
+                        try:
+                            val = int(hex_m, 16)
+                            if val in self.string_lookup:
+                                comment = f'"{self.string_lookup[val]}"'
+                                break
+                        except ValueError:
+                            continue
 
                 insns.append((insn.mnemonic, op, comment))
 
-                # Таблица XREFs
                 for hex_m in re.findall(r"0x[0-9a-fA-F]+", op):
                     try:
                         ref_val = int(hex_m, 16)
-                        xtype = "Call" if insn.group(X86_GRP_CALL) else "Jump" if insn.group(X86_GRP_JUMP) else "Data"
-                        self.xrefs_db.setdefault(ref_val, []).append(("Down", xtype, insn.address, f"{insn.mnemonic} {op}"))
+                        xtype = "Call" if insn.group(X86_GRP_CALL) else "Jump" if insn.group(X86_GRP_JUMP) else "Ref"
+                        self.xrefs_db.setdefault(ref_val, []).append(("Up", xtype, insn.address, f"{insn.mnemonic} {op}"))
                     except ValueError:
                         pass
 
@@ -1304,15 +1568,18 @@ class GandonPRO(QMainWindow):
                     if insn.mnemonic == "jmp":
                         if target and target != curr_va:
                             self.edges.append((curr_va, target, "#569CD6", "uncond"))
+                            self.xrefs_db.setdefault(target, []).append(("Up", "Jump", insn.address, f"jmp loc_{target:08X}"))
                             if target not in visited:
                                 worklist.append(target)
                     else:
                         fallthrough = insn.address + insn.size
                         if target and target != curr_va:
                             self.edges.append((curr_va, target, "#4EC9B0", "true"))
+                            self.xrefs_db.setdefault(target, []).append(("Up", "Cond Jump", insn.address, f"{insn.mnemonic} loc_{target:08X}"))
                             if target not in visited:
                                 worklist.append(target)
                         self.edges.append((curr_va, fallthrough, "#F44747", "false"))
+                        self.xrefs_db.setdefault(fallthrough, []).append(("Up", "Fallthrough", insn.address, f"loc_{fallthrough:08X}"))
                         if fallthrough not in visited:
                             worklist.append(fallthrough)
                     break
@@ -1323,7 +1590,6 @@ class GandonPRO(QMainWindow):
             if insns:
                 self.blocks[curr_va] = insns
 
-        # Поуровневая раскладка
         levels = {addr: 0 for addr in self.blocks}
         for _ in range(len(self.blocks)):
             for src, dst, _, _ in self.edges:
