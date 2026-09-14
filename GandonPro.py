@@ -2,9 +2,13 @@ import sys
 import os
 import re
 import json
+import struct
+import threading
+import ctypes
+from ctypes import wintypes
 import urllib.request
 import pefile
-from capstone import Cs, CS_ARCH_X86, CS_MODE_64, CS_MODE_32
+from capstone import Cs, CS_ARCH_X86, CS_ARCH_ARM, CS_ARCH_ARM64, CS_MODE_64, CS_MODE_32, CS_MODE_ARM
 from capstone.x86 import X86_GRP_JUMP, X86_GRP_CALL, X86_GRP_RET, X86_OP_MEM, X86_REG_RIP
 
 from PyQt6.QtWidgets import (
@@ -13,24 +17,283 @@ from PyQt6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QSplitter, QStatusBar, QTabWidget,
     QPlainTextEdit, QGraphicsView, QGraphicsScene, QGraphicsRectItem,
     QGraphicsTextItem, QGraphicsItem, QGraphicsPathItem, QGraphicsPolygonItem,
-    QDialog, QLabel, QPushButton, QInputDialog, QMessageBox, QMenu
+    QDialog, QLabel, QPushButton, QInputDialog, QMessageBox, QMenu, QCheckBox
 )
 from PyQt6.QtGui import (
     QFont, QColor, QAction, QKeySequence, QPen, QBrush,
     QPainter, QPainterPath, QPolygonF, QCursor, QPixmap, QIcon
 )
-from PyQt6.QtCore import Qt, QRectF, QPointF
+from PyQt6.QtCore import Qt, QRectF, QPointF, pyqtSignal, QObject
 
 
 # =====================================================================
-#                         ABOUT DIALOG
+#             WIN32 DEBUGGER ENGINE (CTYPES BACKEND)
+# =====================================================================
+
+DEBUG_PROCESS = 0x00000001
+CREATE_NEW_CONSOLE = 0x00000010
+DBG_CONTINUE = 0x00010002
+DBG_EXCEPTION_NOT_HANDLED = 0x80010001
+EXCEPTION_DEBUG_EVENT = 1
+EXCEPTION_BREAKPOINT = 0x80000003
+EXCEPTION_SINGLE_STEP = 0x80000004
+CONTEXT_AMD64 = 0x00100000
+CONTEXT_CONTROL = CONTEXT_AMD64 | 0x1
+CONTEXT_INTEGER = CONTEXT_AMD64 | 0x2
+CONTEXT_FULL = CONTEXT_CONTROL | CONTEXT_INTEGER
+
+PAGE_EXECUTE_READWRITE = 0x40
+
+class M128A(ctypes.Structure):
+    _fields_ = [("Low", ctypes.c_uint64), ("High", ctypes.c_int64)]
+
+class CONTEXT64(ctypes.Structure):
+    _fields_ = [
+        ("P1Home", ctypes.c_uint64), ("P2Home", ctypes.c_uint64),
+        ("P3Home", ctypes.c_uint64), ("P4Home", ctypes.c_uint64),
+        ("P5Home", ctypes.c_uint64), ("P6Home", ctypes.c_uint64),
+        ("ContextFlags", ctypes.c_uint32), ("MxCsr", ctypes.c_uint32),
+        ("SegCs", ctypes.c_uint16), ("SegDs", ctypes.c_uint16),
+        ("SegEs", ctypes.c_uint16), ("SegFs", ctypes.c_uint16),
+        ("SegGs", ctypes.c_uint16), ("SegSs", ctypes.c_uint16),
+        ("EFlags", ctypes.c_uint32),
+        ("Dr0", ctypes.c_uint64), ("Dr1", ctypes.c_uint64),
+        ("Dr2", ctypes.c_uint64), ("Dr3", ctypes.c_uint64),
+        ("Dr6", ctypes.c_uint64), ("Dr7", ctypes.c_uint64),
+        ("Rax", ctypes.c_uint64), ("Rcx", ctypes.c_uint64),
+        ("Rdx", ctypes.c_uint64), ("Rbx", ctypes.c_uint64),
+        ("Rsp", ctypes.c_uint64), ("Rbp", ctypes.c_uint64),
+        ("Rsi", ctypes.c_uint64), ("Rdi", ctypes.c_uint64),
+        ("R8", ctypes.c_uint64),  ("R9", ctypes.c_uint64),
+        ("R10", ctypes.c_uint64), ("R11", ctypes.c_uint64),
+        ("R12", ctypes.c_uint64), ("R13", ctypes.c_uint64),
+        ("R14", ctypes.c_uint64), ("R15", ctypes.c_uint64),
+        ("Rip", ctypes.c_uint64),
+        ("Header", M128A * 2),
+        ("Legacy", M128A * 8),
+        ("Xmm0", M128A), ("Xmm1", M128A), ("Xmm2", M128A), ("Xmm3", M128A),
+        ("Xmm4", M128A), ("Xmm5", M128A), ("Xmm6", M128A), ("Xmm7", M128A),
+        ("Xmm8", M128A), ("Xmm9", M128A), ("Xmm10", M128A), ("Xmm11", M128A),
+        ("Xmm12", M128A), ("Xmm13", M128A), ("Xmm14", M128A), ("Xmm15", M128A),
+    ]
+
+class EXCEPTION_RECORD(ctypes.Structure):
+    pass
+EXCEPTION_RECORD._fields_ = [
+    ("ExceptionCode", ctypes.c_uint32),
+    ("ExceptionFlags", ctypes.c_uint32),
+    ("ExceptionRecord", ctypes.POINTER(EXCEPTION_RECORD)),
+    ("ExceptionAddress", ctypes.c_void_p),
+    ("NumberParameters", ctypes.c_uint32),
+    ("ExceptionInformation", ctypes.c_size_t * 15)
+]
+
+class EXCEPTION_DEBUG_INFO(ctypes.Structure):
+    _fields_ = [
+        ("ExceptionRecord", EXCEPTION_RECORD),
+        ("dwFirstChance", ctypes.c_uint32)
+    ]
+
+class DEBUG_EVENT_UNION(ctypes.Union):
+    _fields_ = [("Exception", EXCEPTION_DEBUG_INFO)]
+
+class DEBUG_EVENT(ctypes.Structure):
+    _fields_ = [
+        ("dwDebugEventCode", ctypes.c_uint32),
+        ("dwProcessId", ctypes.c_uint32),
+        ("dwThreadId", ctypes.c_uint32),
+        ("u", DEBUG_EVENT_UNION)
+    ]
+
+class STARTUPINFOW(ctypes.Structure):
+    _fields_ = [
+        ("cb", ctypes.c_uint32), ("lpReserved", wintypes.LPWSTR),
+        ("lpDesktop", wintypes.LPWSTR), ("lpTitle", wintypes.LPWSTR),
+        ("dwX", ctypes.c_uint32), ("dwY", ctypes.c_uint32),
+        ("dwXSize", ctypes.c_uint32), ("dwYSize", ctypes.c_uint32),
+        ("dwXCountChars", ctypes.c_uint32), ("dwYCountChars", ctypes.c_uint32),
+        ("dwFillAttribute", ctypes.c_uint32), ("dwFlags", ctypes.c_uint32),
+        ("wShowWindow", ctypes.c_uint16), ("cbReserved2", ctypes.c_uint16),
+        ("lpReserved2", ctypes.c_char_p), ("hStdInput", ctypes.c_void_p),
+        ("hStdOutput", ctypes.c_void_p), ("hStdError", ctypes.c_void_p)
+    ]
+
+class PROCESS_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("hProcess", ctypes.c_void_p), ("hThread", ctypes.c_void_p),
+        ("dwProcessId", ctypes.c_uint32), ("dwThreadId", ctypes.c_uint32)
+    ]
+
+class PROCESS_BASIC_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("ExitStatus", ctypes.c_ulonglong),
+        ("PebBaseAddress", ctypes.c_void_p),
+        ("AffinityMask", ctypes.c_ulonglong),
+        ("BasePriority", ctypes.c_ulonglong),
+        ("UniqueProcessId", ctypes.c_ulonglong),
+        ("InheritedFromUniqueProcessId", ctypes.c_ulonglong)
+    ]
+
+class DebuggerSignals(QObject):
+    state_changed = pyqtSignal(str)
+    registers_updated = pyqtSignal(dict)
+    breakpoint_hit = pyqtSignal(int)
+
+class Win32Debugger:
+    def __init__(self, signals):
+        self.signals = signals
+        self.k32 = ctypes.windll.kernel32
+        self.ntdll = ctypes.windll.ntdll
+        self.process_info = None
+        self.is_running = False
+        self.target_path = ""
+        self.worker_thread = None
+        self.stealth_mode = True
+
+        self.k32.CreateProcessW.argtypes = [
+            wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.c_void_p,
+            ctypes.c_void_p, wintypes.BOOL, wintypes.DWORD,
+            ctypes.c_void_p, wintypes.LPCWSTR,
+            ctypes.POINTER(STARTUPINFOW), ctypes.POINTER(PROCESS_INFORMATION)
+        ]
+        self.k32.CreateProcessW.restype = wintypes.BOOL
+        self.k32.WaitForDebugEvent.argtypes = [ctypes.POINTER(DEBUG_EVENT), wintypes.DWORD]
+        self.k32.WaitForDebugEvent.restype = wintypes.BOOL
+        self.k32.ContinueDebugEvent.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.DWORD]
+        self.k32.ContinueDebugEvent.restype = wintypes.BOOL
+
+    def start_process(self, path):
+        self.target_path = path
+        self.worker_thread = threading.Thread(target=self._run_debugger, daemon=True)
+        self.worker_thread.start()
+
+    def _run_debugger(self):
+        si = STARTUPINFOW()
+        si.cb = ctypes.sizeof(STARTUPINFOW)
+        pi = PROCESS_INFORMATION()
+
+        formatted_cmd = f'"{os.path.abspath(self.target_path)}"'
+
+        success = self.k32.CreateProcessW(
+            None, formatted_cmd, None, None, False,
+            DEBUG_PROCESS | CREATE_NEW_CONSOLE, None, None,
+            ctypes.byref(si), ctypes.byref(pi)
+        )
+        if not success:
+            err_code = self.k32.GetLastError()
+            self.signals.state_changed.emit(f"CreateProcess Error: {err_code}")
+            return
+
+        self.process_info = pi
+        self.is_running = True
+        self.signals.state_changed.emit(f"Debugger attached: PID {pi.dwProcessId}")
+
+        debug_event = DEBUG_EVENT()
+        first_bp = True
+
+        while self.is_running:
+            if not self.k32.WaitForDebugEvent(ctypes.byref(debug_event), 100):
+                continue
+
+            continue_status = DBG_CONTINUE
+
+            if debug_event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT:
+                code = debug_event.u.Exception.ExceptionRecord.ExceptionCode
+                addr = debug_event.u.Exception.ExceptionRecord.ExceptionAddress
+
+                if self.stealth_mode:
+                    self.apply_stealth_hooks()
+
+                if code == EXCEPTION_BREAKPOINT:
+                    if first_bp:
+                        first_bp = False
+                        self.signals.state_changed.emit("Stealth mode active: PEB & API hooks applied.")
+                        self._read_context(pi.hThread)
+                    else:
+                        self.signals.breakpoint_hit.emit(addr or 0)
+                        self._read_context(pi.hThread)
+
+                elif code == EXCEPTION_SINGLE_STEP:
+                    self._read_context(pi.hThread)
+
+            self.k32.ContinueDebugEvent(
+                debug_event.dwProcessId,
+                debug_event.dwThreadId,
+                continue_status
+            )
+
+    def _read_context(self, h_thread):
+        ctx = CONTEXT64()
+        ctx.ContextFlags = CONTEXT_FULL
+        if self.k32.GetThreadContext(h_thread, ctypes.byref(ctx)):
+            regs = {
+                "RAX": hex(ctx.Rax), "RBX": hex(ctx.Rbx),
+                "RCX": hex(ctx.Rcx), "RDX": hex(ctx.Rdx),
+                "RSI": hex(ctx.Rsi), "RDI": hex(ctx.Rdi),
+                "RSP": hex(ctx.Rsp), "RBP": hex(ctx.Rbp),
+                "RIP": hex(ctx.Rip), "EFLAGS": hex(ctx.EFlags)
+            }
+            self.signals.registers_updated.emit(regs)
+
+    def apply_stealth_hooks(self):
+        if not self.process_info or not self.is_running:
+            return False, "Target process is not running."
+
+        h_proc = self.process_info.hProcess
+        pbi = PROCESS_BASIC_INFORMATION()
+        ret_len = ctypes.c_ulong(0)
+        status = self.ntdll.NtQueryInformationProcess(
+            h_proc, 0, ctypes.byref(pbi), ctypes.sizeof(pbi), ctypes.byref(ret_len)
+        )
+
+        logs = []
+        if status == 0 and pbi.PebBaseAddress:
+            peb_addr = pbi.PebBaseAddress
+            zero_byte = (ctypes.c_ubyte * 1)(0)
+            zero_dword = (ctypes.c_uint32 * 1)(0)
+            self.k32.WriteProcessMemory(h_proc, ctypes.c_void_p(peb_addr + 2), zero_byte, 1, None)
+            self.k32.WriteProcessMemory(h_proc, ctypes.c_void_p(peb_addr + 0xBC), zero_dword, 4, None)
+            logs.append("PEB.BeingDebugged -> 0")
+            logs.append("PEB.NtGlobalFlag -> 0")
+
+        patch = (ctypes.c_ubyte * 3)(0x31, 0xC0, 0xC3)
+        old_prot = ctypes.c_uint32()
+
+        for mod_name in [b"kernel32.dll", b"kernelbase.dll"]:
+            h_mod = self.k32.GetModuleHandleA(mod_name)
+            if h_mod:
+                p_func = self.k32.GetProcAddress(h_mod, b"IsDebuggerPresent")
+                if p_func:
+                    self.k32.VirtualProtectEx(h_proc, ctypes.c_void_p(p_func), 3, PAGE_EXECUTE_READWRITE, ctypes.byref(old_prot))
+                    self.k32.WriteProcessMemory(h_proc, ctypes.c_void_p(p_func), patch, 3, None)
+                    self.k32.VirtualProtectEx(h_proc, ctypes.c_void_p(p_func), 3, old_prot.value, ctypes.byref(old_prot))
+
+        h_k32 = self.k32.GetModuleHandleA(b"kernel32.dll")
+        p_chk = self.k32.GetProcAddress(h_k32, b"CheckRemoteDebuggerPresent")
+        if p_chk:
+            patch_chk = (ctypes.c_ubyte * 7)(0xC7, 0x02, 0x00, 0x00, 0x00, 0x00, 0xC3)
+            self.k32.VirtualProtectEx(h_proc, ctypes.c_void_p(p_chk), 7, PAGE_EXECUTE_READWRITE, ctypes.byref(old_prot))
+            self.k32.WriteProcessMemory(h_proc, ctypes.c_void_p(p_chk), patch_chk, 7, None)
+            self.k32.VirtualProtectEx(h_proc, ctypes.c_void_p(p_chk), 7, old_prot.value, ctypes.byref(old_prot))
+
+        return True, "Stealth applied."
+
+    def stop(self):
+        self.is_running = False
+        if self.process_info:
+            self.k32.TerminateProcess(self.process_info.hProcess, 0)
+            self.signals.state_changed.emit("Debug process terminated.")
+
+
+# =====================================================================
+#                         ABOUT DIALOG (FIXED)
 # =====================================================================
 
 class AboutDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("About Gandon-PRO")
-        self.setFixedSize(520, 220)
+        self.setFixedSize(600, 230)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint)
 
         main_layout = QVBoxLayout(self)
@@ -51,11 +314,8 @@ class AboutDialog(QDialog):
         img_url = "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSXUZJKTeH1k3qfSP61Rui3VuQrGMQ5zlMmmAz4F5x3NN1QRFZq"
         pixmap = QPixmap()
         try:
-            req = urllib.request.Request(
-                img_url,
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-            )
-            with urllib.request.urlopen(req, timeout=3) as response:
+            req = urllib.request.Request(img_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=2) as response:
                 pixmap.loadFromData(response.read())
         except Exception:
             pass
@@ -81,14 +341,16 @@ class AboutDialog(QDialog):
         info_layout = QVBoxLayout()
         info_layout.setSpacing(6)
 
-        title_label = QLabel("Gandon: The Interactive Disassembler")
-        title_label.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+        title_label = QLabel("Gandon: The Interactive Disassembler & Debugger")
+        title_label.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         title_label.setStyleSheet("color: #ffffff; border: none;")
+        title_label.setWordWrap(True)
         info_layout.addWidget(title_label)
 
-        ver_label = QLabel("Version Beta Windows x64")
+        ver_label = QLabel("Version Beta 2.0 (PE/ELF + Win32 Debugger + Anti-Debug)")
         ver_label.setFont(QFont("Segoe UI", 10))
         ver_label.setStyleSheet("color: #cccccc; border: none;")
+        ver_label.setWordWrap(True)
         info_layout.addWidget(ver_label)
 
         url_label = QLabel("<a href='https://gandon-pro.github.io' style='color: #4EC9B0; text-decoration: underline;'>gandon-pro.github.io</a>")
@@ -388,7 +650,7 @@ class BasicBlockItem(QGraphicsRectItem):
         html += "<hr style='border: 0.5px solid #3c3c3c; margin: 3px 0;'/>"
 
         for mnem, op, comm in self.instructions:
-            c_mnem = "#569CD6" if mnem.startswith("j") or mnem in ("call", "ret") else "#9CDCFE"
+            c_mnem = "#569CD6" if mnem.startswith("j") or mnem in ("call", "ret", "b", "bx", "bl") else "#9CDCFE"
             disp_op = op
             if highlight_token and highlight_token.lower() in op.lower():
                 pattern = re.compile(re.escape(highlight_token), re.IGNORECASE)
@@ -417,6 +679,7 @@ class BasicBlockItem(QGraphicsRectItem):
     def contextMenuEvent(self, event):
         menu = QMenu()
         act_decompile = menu.addAction("View Pseudocode (F5)")
+        act_bp = menu.addAction("Toggle Breakpoint (F2)")
         act_rename = menu.addAction("Rename Label (N)")
         act_comment = menu.addAction("Add Comment (;)")
         act_sig = menu.addAction("Generate SigMaker Pattern (Ctrl+B)")
@@ -430,6 +693,8 @@ class BasicBlockItem(QGraphicsRectItem):
         action = menu.exec(event.screenPos())
         if action == act_decompile:
             self.main_window.action_decompile_pseudocode()
+        elif action == act_bp:
+            self.main_window.toggle_breakpoint(self.addr)
         elif action == act_rename:
             self.main_window.action_rename_node()
         elif action == act_comment:
@@ -574,10 +839,6 @@ class GraphView(QGraphicsView):
         self.edges.append(edge)
 
 
-# =====================================================================
-#                 GRAPH OVERVIEW (СЛЕДЯЩАЯ МИНИ-КАРТА)
-# =====================================================================
-
 class GraphOverview(QGraphicsView):
     def __init__(self, main_view, parent=None):
         super().__init__(parent)
@@ -636,10 +897,6 @@ class GraphOverview(QGraphicsView):
         self.update_viewport()
 
 
-# =====================================================================
-#                 GANDON TEXT LISTING (SPACE KEY)
-# =====================================================================
-
 class FlatDisasmWidget(QWidget):
     def __init__(self, main_window):
         super().__init__()
@@ -673,10 +930,6 @@ class FlatDisasmWidget(QWidget):
         self.editor.setPlainText("\n".join(lines))
 
 
-# =====================================================================
-#                 PSEUDOCODE DECOMPILER VIEW (F5 KEY)
-# =====================================================================
-
 class PseudocodeWidget(QWidget):
     def __init__(self, main_window):
         super().__init__()
@@ -704,21 +957,19 @@ class PseudocodeWidget(QWidget):
         func_name = self.main_window.custom_names.get(start_va, f"sub_{start_va:08X}")
         lines = []
         lines.append(f"// ==========================================================================")
-        lines.append(f"// Decompiled by Gandon-PRO Pseudocode Engine (Architecture: x86-64)")
+        lines.append(f"// Decompiled by Gandon-PRO Pseudocode Engine")
         lines.append(f"// Function Entry: 0x{start_va:08X} - {func_name}")
         lines.append(f"// ==========================================================================\n")
         lines.append(f"__int64 __fastcall {func_name}(__int64 a1, __int64 a2, __int64 a3, __int64 a4)")
         lines.append("{")
         lines.append("    __int64 result = 0;")
-        lines.append("    __int64 v0, v1, v2, v3;")
-        lines.append("    unsigned __int64 v_ret = 0;\n")
+        lines.append("    __int64 v0, v1, v2, v3;\n")
 
         cond_map = {
             "je": "==", "jz": "==", "jne": "!=", "jnz": "!=",
             "jg": ">", "jge": ">=", "jl": "<", "jle": "<=",
             "ja": ">", "jae": ">=", "jb": "<", "jbe": "<="
         }
-
         last_cmp = ("v0", "0", "==")
 
         for addr in sorted(blocks.keys()):
@@ -746,7 +997,7 @@ class PseudocodeWidget(QWidget):
                     if len(parts) == 2:
                         lines.append(f"    {parts[0]} {op_sym} {parts[1]};")
 
-                elif mnem == "cmp" or mnem == "test":
+                elif mnem in ("cmp", "test"):
                     if len(parts) == 2:
                         last_cmp = (parts[0], parts[1], "==" if mnem == "test" else "==")
 
@@ -775,7 +1026,7 @@ class PseudocodeWidget(QWidget):
                     call_label = f"/* {c} */" if c else ""
                     lines.append(f"    result = ((__int64 (*)(...)){target})({call_label});")
 
-                elif mnem == "ret":
+                elif mnem in ("ret", "bx lr"):
                     lines.append("    return result;")
 
             lines.append("")
@@ -784,10 +1035,6 @@ class PseudocodeWidget(QWidget):
         lines.append("}")
         self.editor.setPlainText("\n".join(lines))
 
-
-# =====================================================================
-#                         HEX VIEW
-# =====================================================================
 
 class HexViewWidget(QWidget):
     def __init__(self, main_window):
@@ -810,16 +1057,11 @@ class HexViewWidget(QWidget):
         """)
         layout.addWidget(self.editor)
 
-    def load_hex(self, pe, image_base, target_va, num_lines=512):
-        if not pe:
+    def load_hex(self, raw_data, image_base, target_va, num_lines=512):
+        if not raw_data:
             return
-        try:
-            offset = pe.get_offset_from_rva(target_va - image_base)
-        except Exception:
-            offset = 0
-            target_va = image_base
-
-        data = pe.__data__[offset: offset + num_lines * 16]
+        offset = max(0, target_va - image_base)
+        data = raw_data[offset: offset + num_lines * 16]
         lines = []
         for idx in range(0, len(data), 16):
             chunk = data[idx: idx + 16]
@@ -831,18 +1073,11 @@ class HexViewWidget(QWidget):
         self.editor.setPlainText("\n".join(lines))
 
 
-# =====================================================================
-#                         САБВЬЮ ВКЛАДОК
-# =====================================================================
-
 class StringsWidget(QWidget):
     def __init__(self, main_window):
         super().__init__()
         self.main_window = main_window
         self.raw_strings = []
-        self.init_ui()
-
-    def init_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self.search_bar = QLineEdit()
@@ -859,21 +1094,15 @@ class StringsWidget(QWidget):
         self.table.itemDoubleClicked.connect(self.on_double_click)
         layout.addWidget(self.table)
 
-    def extract_strings(self, pe, image_base, min_len=4):
+    def extract_strings(self, raw_data, image_base, min_len=4):
         self.raw_strings.clear()
-        if not pe:
+        if not raw_data:
             return
         ascii_regex = re.compile(rb"[\x20-\x7E]{" + str(min_len).encode() + rb",}")
-        for section in pe.sections:
-            try:
-                sec_data = section.get_data()
-                sec_rva = section.VirtualAddress
-                for match in ascii_regex.finditer(sec_data):
-                    va = image_base + sec_rva + match.start()
-                    text = match.group().decode("ascii", errors="ignore")
-                    self.raw_strings.append((va, len(text), "ASCII", text))
-            except Exception:
-                continue
+        for match in ascii_regex.finditer(raw_data):
+            va = image_base + match.start()
+            text = match.group().decode("ascii", errors="ignore")
+            self.raw_strings.append((va, len(text), "ASCII", text))
         self.populate_table(self.raw_strings)
 
     def populate_table(self, items):
@@ -977,25 +1206,74 @@ class ExportsWidget(QWidget):
                 self.table.setItem(row, 0, QTableWidgetItem(addr))
                 self.table.setItem(row, 1, QTableWidgetItem(str(exp.ordinal)))
                 self.table.setItem(row, 2, QTableWidgetItem(name))
-        else:
-            ep = getattr(pe.OPTIONAL_HEADER, "AddressOfEntryPoint", 0)
-            if ep:
-                self.table.insertRow(0)
-                self.table.setItem(0, 0, QTableWidgetItem(f"0x{image_base + ep:08X}"))
-                self.table.setItem(0, 1, QTableWidgetItem("[main entry]"))
-                self.table.setItem(0, 2, QTableWidgetItem("DllEntryPoint"))
 
 
-# =====================================================================
-#                         ГЛАВНОЕ ОКНО
-# =====================================================================
+class DebuggerWidget(QWidget):
+    def __init__(self, main_window):
+        super().__init__()
+        self.main_window = main_window
+        layout = QHBoxLayout(self)
+
+        self.reg_table = QTableWidget()
+        self.reg_table.setColumnCount(2)
+        self.reg_table.setHorizontalHeaderLabels(["Register", "Value (Hex)"])
+        self.reg_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.reg_table.setStyleSheet("background: #252526; color: #4EC9B0; font-family: Consolas;")
+        layout.addWidget(self.reg_table, stretch=1)
+
+        ctrl_panel = QWidget()
+        ctrl_layout = QVBoxLayout(ctrl_panel)
+
+        self.chk_auto_antidebug = QCheckBox("Auto-Apply Anti-Debug on Start")
+        self.chk_auto_antidebug.setChecked(True)
+        self.chk_auto_antidebug.toggled.connect(self.on_toggle_auto_antidebug)
+        self.chk_auto_antidebug.setStyleSheet("color: #4EC9B0; font-weight: bold;")
+        ctrl_layout.addWidget(self.chk_auto_antidebug)
+
+        self.btn_run = QPushButton("Run / Continue (F9)")
+        self.btn_run.clicked.connect(self.main_window.dbg_continue)
+        self.btn_run.setStyleSheet("background: #007acc; color: white; padding: 6px; font-weight: bold;")
+        ctrl_layout.addWidget(self.btn_run)
+
+        self.btn_antidebug = QPushButton("Apply Anti-Debug Bypass Now")
+        self.btn_antidebug.clicked.connect(self.main_window.action_apply_antidebug)
+        self.btn_antidebug.setStyleSheet("background: #388A34; color: white; padding: 6px;")
+        ctrl_layout.addWidget(self.btn_antidebug)
+
+        self.btn_stop = QPushButton("Terminate Process")
+        self.btn_stop.clicked.connect(self.main_window.dbg_stop)
+        self.btn_stop.setStyleSheet("background: #A1260D; color: white; padding: 6px;")
+        ctrl_layout.addWidget(self.btn_stop)
+
+        ctrl_layout.addWidget(QLabel("<b>Breakpoints:</b>"))
+        self.bp_list = QTreeWidget()
+        self.bp_list.setHeaderLabels(["Address", "Type"])
+        ctrl_layout.addWidget(self.bp_list)
+
+        layout.addWidget(ctrl_panel, stretch=2)
+
+    def on_toggle_auto_antidebug(self, checked):
+        self.main_window.dbg.stealth_mode = checked
+        if hasattr(self.main_window, "act_stealth_toggle"):
+            self.main_window.act_stealth_toggle.setChecked(checked)
+        self.main_window.status_bar.showMessage(f"Auto Anti-Debug on start: {'ENABLED' if checked else 'DISABLED'}")
+
+    def update_registers(self, regs_dict):
+        self.reg_table.setRowCount(len(regs_dict))
+        for row, (k, v) in enumerate(regs_dict.items()):
+            self.reg_table.setItem(row, 0, QTableWidgetItem(k))
+            self.reg_table.setItem(row, 1, QTableWidgetItem(v))
+
 
 class GandonPRO(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Gandon-PRO - Disassembler")
-        self.resize(1280, 800)
+        self.setWindowTitle("Gandon-PRO - The Interactive Disassembler & Debugger")
+        self.resize(1400, 880)
 
+        self.current_binary_path = ""
+        self.raw_data = bytearray()
+        self.is_elf = False
         self.pe = None
         self.cs = None
         self.image_base = 0
@@ -1005,6 +1283,14 @@ class GandonPRO(QMainWindow):
         self.edges = []
         self.xrefs_db = {}
         self.history = []
+        self.patch_history = {}
+        self.breakpoints = set()
+
+        self.dbg_signals = DebuggerSignals()
+        self.dbg = Win32Debugger(self.dbg_signals)
+        self.dbg_signals.registers_updated.connect(self.on_dbg_registers)
+        self.dbg_signals.state_changed.connect(lambda msg: self.status_bar.showMessage(msg))
+        self.dbg_signals.breakpoint_hit.connect(self.on_dbg_bp_hit)
 
         self.custom_names = {}
         self.custom_comments = {}
@@ -1017,7 +1303,7 @@ class GandonPRO(QMainWindow):
         menubar = self.menuBar()
 
         file_menu = menubar.addMenu("File")
-        open_act = QAction("Open PE File...", self)
+        open_act = QAction("Open Binary (PE/ELF/SO)...", self)
         open_act.setShortcut(QKeySequence("Ctrl+O"))
         open_act.triggered.connect(self.open_file_dialog)
         file_menu.addAction(open_act)
@@ -1028,9 +1314,14 @@ class GandonPRO(QMainWindow):
         file_menu.addAction(save_db_act)
 
         load_db_act = QAction("Load Database (.gnd)...", self)
-        load_db_act.setShortcut(QKeySequence("Ctrl+S"))
+        load_db_act.setShortcut(QKeySequence("Ctrl+L"))
         load_db_act.triggered.connect(self.load_database)
         file_menu.addAction(load_db_act)
+
+        apply_patch_act = QAction("Apply Patches to File...", self)
+        apply_patch_act.setShortcut(QKeySequence("Ctrl+Alt+P"))
+        apply_patch_act.triggered.connect(self.action_export_patched_file)
+        file_menu.addAction(apply_patch_act)
 
         export_png_act = QAction("Export Graph to PNG...", self)
         export_png_act.triggered.connect(self.export_graph_png)
@@ -1089,6 +1380,29 @@ class GandonPRO(QMainWindow):
         search_sig_act.triggered.connect(self.action_search_pattern)
         tools_menu.addAction(search_sig_act)
 
+        dbg_menu = menubar.addMenu("Debugger")
+        dbg_run_act = QAction("Start / Continue Process", self)
+        dbg_run_act.setShortcut(QKeySequence("F9"))
+        dbg_run_act.triggered.connect(self.dbg_continue)
+        dbg_menu.addAction(dbg_run_act)
+
+        dbg_bp_act = QAction("Toggle Breakpoint", self)
+        dbg_bp_act.triggered.connect(lambda: self.toggle_breakpoint(self.current_va))
+        dbg_menu.addAction(dbg_bp_act)
+
+        self.act_stealth_toggle = QAction("Auto-Stealth on Startup", self, checkable=True)
+        self.act_stealth_toggle.setChecked(True)
+        self.act_stealth_toggle.toggled.connect(self.on_menu_stealth_toggle)
+        dbg_menu.addAction(self.act_stealth_toggle)
+
+        antidebug_act = QAction("Apply Anti-Debug Bypass Now", self)
+        antidebug_act.triggered.connect(self.action_apply_antidebug)
+        dbg_menu.addAction(antidebug_act)
+
+        dbg_stop_act = QAction("Stop Process", self)
+        dbg_stop_act.triggered.connect(self.dbg_stop)
+        dbg_menu.addAction(dbg_stop_act)
+
         view_menu = menubar.addMenu("View")
         toggle_view_act = QAction("Switch Graph / Text Listing", self)
         toggle_view_act.setShortcut(QKeySequence(Qt.Key.Key_Space))
@@ -1108,25 +1422,29 @@ class GandonPRO(QMainWindow):
         act_pseudo.triggered.connect(self.action_decompile_pseudocode)
         view_menu.addAction(act_pseudo)
 
+        act_dbg_tab = QAction("Debugger Win32", self)
+        act_dbg_tab.triggered.connect(lambda: self.tab_widget.setCurrentIndex(3))
+        view_menu.addAction(act_dbg_tab)
+
         act_hex = QAction("Hex View-1", self)
-        act_hex.triggered.connect(lambda: self.tab_widget.setCurrentIndex(3))
+        act_hex.triggered.connect(lambda: self.tab_widget.setCurrentIndex(4))
         view_menu.addAction(act_hex)
 
         act_types = QAction("Local Types", self)
-        act_types.triggered.connect(lambda: self.tab_widget.setCurrentIndex(4))
+        act_types.triggered.connect(lambda: self.tab_widget.setCurrentIndex(5))
         view_menu.addAction(act_types)
 
         act_imports = QAction("Imports", self)
-        act_imports.triggered.connect(lambda: self.tab_widget.setCurrentIndex(5))
+        act_imports.triggered.connect(lambda: self.tab_widget.setCurrentIndex(6))
         view_menu.addAction(act_imports)
 
         act_exports = QAction("Exports", self)
-        act_exports.triggered.connect(lambda: self.tab_widget.setCurrentIndex(6))
+        act_exports.triggered.connect(lambda: self.tab_widget.setCurrentIndex(7))
         view_menu.addAction(act_exports)
 
         act_strings = QAction("Strings", self)
         act_strings.setShortcut(QKeySequence("Shift+F12"))
-        act_strings.triggered.connect(lambda: self.tab_widget.setCurrentIndex(7))
+        act_strings.triggered.connect(lambda: self.tab_widget.setCurrentIndex(8))
         view_menu.addAction(act_strings)
 
         help_menu = menubar.addMenu("Help")
@@ -1137,15 +1455,14 @@ class GandonPRO(QMainWindow):
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
 
         self.nav_tree = QTreeWidget()
-        self.nav_tree.setHeaderLabels(["Functions / Labels", "Address"])
-        self.nav_tree.setMinimumWidth(210)
+        self.nav_tree.setHeaderLabels(["Functions / Symbols", "Address"])
+        self.nav_tree.setMinimumWidth(220)
         self.nav_tree.header().resizeSection(0, 150)
         self.nav_tree.itemDoubleClicked.connect(self.on_nav_item_clicked)
         self.main_splitter.addWidget(self.nav_tree)
 
         self.tab_widget = QTabWidget()
         self.tab_widget.setMovable(True)
-        self.tab_widget.tabBar().setExpanding(True)
 
         self.graph_container = QWidget()
         g_layout = QVBoxLayout(self.graph_container)
@@ -1157,25 +1474,20 @@ class GandonPRO(QMainWindow):
         self.overview.move(15, 15)
 
         self.tab_widget.addTab(self.graph_container, "Gandon View-A")
-
         self.flat_view = FlatDisasmWidget(self)
         self.tab_widget.addTab(self.flat_view, "Gandon Text Listing")
-
         self.pseudocode_view = PseudocodeWidget(self)
         self.tab_widget.addTab(self.pseudocode_view, "Pseudocode-A")
-
+        self.dbg_widget = DebuggerWidget(self)
+        self.tab_widget.addTab(self.dbg_widget, "Debugger Win32")
         self.hex_view = HexViewWidget(self)
         self.tab_widget.addTab(self.hex_view, "Hex View-1")
-
         self.local_types_view = LocalTypesWidget()
         self.tab_widget.addTab(self.local_types_view, "Local Types")
-
         self.imports_view = ImportsWidget(self)
         self.tab_widget.addTab(self.imports_view, "Imports")
-
         self.exports_view = ExportsWidget(self)
         self.tab_widget.addTab(self.exports_view, "Exports")
-
         self.strings_view = StringsWidget(self)
         self.tab_widget.addTab(self.strings_view, "Strings")
 
@@ -1187,7 +1499,7 @@ class GandonPRO(QMainWindow):
         self.setCentralWidget(self.main_splitter)
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("Ready. Shortcuts: F5 (Pseudocode), X (XREFs), Ctrl+B (SigMaker), Space (Switch), G (Jump)")
+        self.status_bar.showMessage("Ready. Shortcuts: F5 (Pseudocode), F9 (Debug Run), X (XREFs), Ctrl+B (SigMaker), Space (Switch)")
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1201,10 +1513,17 @@ class GandonPRO(QMainWindow):
             QMainWindow { background-color: #1e1e1e; }
             QMenuBar { background-color: #2d2d2d; color: #cccccc; }
             QMenuBar::item:selected { background-color: #3e3e3e; }
-            QMenu { background-color: #252526; color: #cccccc; border: 1px solid #3c3c3c; padding: 4px; }
-            QMenu::item { padding: 4px 24px 4px 12px; }
+            QMenu { 
+                background-color: #252526; 
+                color: #cccccc; 
+                border: 1px solid #3c3c3c; 
+                padding: 4px; 
+            }
+            QMenu::item { 
+                padding: 4px 38px 4px 14px; 
+                min-width: 180px;
+            }
             QMenu::item:selected { background-color: #007acc; color: #ffffff; }
-            QMenu::shortcut { padding-left: 15px; color: #9cdcfe; }
             QTreeWidget { background-color: #252526; color: #d4d4d4; border: 1px solid #3c3c3c; }
             QTableWidget { background-color: #1e1e1e; color: #d4d4d4; border: none; gridline-color: #2a2a2a; }
             QLineEdit { background-color: #252526; color: #d4d4d4; border: 1px solid #3c3c3c; padding: 4px; font-family: Consolas; }
@@ -1213,7 +1532,7 @@ class GandonPRO(QMainWindow):
             QTabBar::tab { 
                 background: #252526; 
                 color: #969696; 
-                padding: 6px 4px; 
+                padding: 6px 10px; 
                 border: 1px solid #333333; 
                 border-bottom: none;
             }
@@ -1238,12 +1557,12 @@ class GandonPRO(QMainWindow):
             dialog.move(x, y)
         dialog.exec()
 
-    # =====================================================================
-    #                         ДЕЙСТВИЯ И ХОТКЕИ
-    # =====================================================================
+    def on_menu_stealth_toggle(self, checked):
+        self.dbg.stealth_mode = checked
+        if hasattr(self, "dbg_widget"):
+            self.dbg_widget.chk_auto_antidebug.setChecked(checked)
 
     def action_decompile_pseudocode(self):
-        # Хоткей F5: Переключение на псевдокод
         self.pseudocode_view.decompile(self.blocks, self.current_va)
         self.tab_widget.setCurrentIndex(2)
 
@@ -1375,16 +1694,43 @@ class GandonPRO(QMainWindow):
         for item in self.graph_view.scene.selectedItems():
             if isinstance(item, BasicBlockItem):
                 try:
-                    offset = self.pe.get_offset_from_rva(item.addr - self.image_base)
-                    byte_arr = bytearray(self.pe.__data__)
+                    offset = (item.addr - self.image_base) if self.is_elf else self.pe.get_offset_from_rva(item.addr - self.image_base)
                     for i in range(min(15, len(item.instructions) * 3)):
-                        byte_arr[offset + i] = 0x90
-                    self.pe.__data__ = bytes(byte_arr)
-                    self.status_bar.showMessage(f"Patched block 0x{item.addr:08X} with NOPs")
+                        if offset + i < len(self.raw_data):
+                            old = self.raw_data[offset + i]
+                            self.raw_data[offset + i] = 0x90
+                            self.patch_history[offset + i] = (old, 0x90)
+                    if self.pe:
+                        self.pe.__data__ = bytes(self.raw_data)
+                    self.status_bar.showMessage(f"Patched block 0x{item.addr:08X} with NOPs. Ctrl+Alt+P to save.")
                     self.build_cfg_graph(self.current_va)
                 except Exception as e:
                     QMessageBox.warning(self, "Patch Error", str(e))
                 return
+
+    def action_export_patched_file(self):
+        if not self.patch_history:
+            QMessageBox.information(self, "Patcher", "No patches have been applied to this binary.")
+            return
+
+        out_path, _ = QFileDialog.getSaveFileName(self, "Export Patched Binary", "", "Executables (*.exe *.dll *.so);;All (*)")
+        if not out_path:
+            return
+
+        if self.pe:
+            try:
+                temp_pe = pefile.PE(data=bytes(self.raw_data))
+                temp_pe.OPTIONAL_HEADER.CheckSum = temp_pe.generate_checksum()
+                patched_bytes = temp_pe.write()
+            except Exception:
+                patched_bytes = bytes(self.raw_data)
+        else:
+            patched_bytes = bytes(self.raw_data)
+
+        with open(out_path, "wb") as f:
+            f.write(patched_bytes)
+
+        QMessageBox.information(self, "Patcher", f"Successfully saved {len(self.patch_history)} patched bytes to:\n{out_path}")
 
     def action_generate_signature(self):
         selected_node = None
@@ -1393,13 +1739,13 @@ class GandonPRO(QMainWindow):
                 selected_node = item
                 break
 
-        if not selected_node or not self.pe:
+        if not selected_node or not self.raw_data:
             QMessageBox.information(self, "SigMaker", "Select a block to generate a signature.")
             return
 
         try:
-            offset = self.pe.get_offset_from_rva(selected_node.addr - self.image_base)
-            raw = self.pe.__data__[offset: offset + 64]
+            offset = (selected_node.addr - self.image_base) if self.is_elf else self.pe.get_offset_from_rva(selected_node.addr - self.image_base)
+            raw = self.raw_data[offset: offset + 64]
             disasm_list = list(self.cs.disasm(raw, selected_node.addr))
         except Exception:
             return
@@ -1440,12 +1786,12 @@ class GandonPRO(QMainWindow):
                 else:
                     regex_parts.append(re.escape(bytes.fromhex(token)))
             reg = re.compile(b"".join(regex_parts), re.DOTALL)
-            return len(reg.findall(self.pe.__data__))
+            return len(reg.findall(self.raw_data))
         except Exception:
             return 0
 
     def action_search_pattern(self):
-        if not self.pe or not hasattr(self.pe, "__data__"):
+        if not self.raw_data:
             QMessageBox.information(self, "Pattern Search", "Please load a binary file first.")
             return
 
@@ -1464,7 +1810,7 @@ class GandonPRO(QMainWindow):
 
         regex_parts = []
         for t in tokens:
-            if t == "?" or t == "??":
+            if t in ("?", "??"):
                 regex_parts.append(b".")
             else:
                 hex_val = t.zfill(2) if len(t) == 1 else t
@@ -1472,7 +1818,7 @@ class GandonPRO(QMainWindow):
                     b_val = bytes.fromhex(hex_val)
                     regex_parts.append(re.escape(b_val))
                 except ValueError:
-                    QMessageBox.warning(self, "Invalid Pattern", f"Invalid hex byte: '{t}'. Use values from 00 to FF or '?'.")
+                    QMessageBox.warning(self, "Invalid Pattern", f"Invalid hex byte: '{t}'.")
                     return
 
         if not regex_parts:
@@ -1480,16 +1826,16 @@ class GandonPRO(QMainWindow):
 
         try:
             reg = re.compile(b"".join(regex_parts), re.DOTALL)
-            match = reg.search(self.pe.__data__)
+            match = reg.search(self.raw_data)
             if match:
                 found_offset = match.start()
-                try:
+                if self.is_elf:
+                    target_va = self.image_base + found_offset
+                else:
                     found_rva = self.pe.get_rva_from_offset(found_offset)
                     target_va = self.image_base + found_rva
-                    self.jump_to_address(target_va)
-                    self.status_bar.showMessage(f"Pattern found at 0x{target_va:08X}")
-                except Exception:
-                    QMessageBox.warning(self, "Pattern Search", f"Pattern matched at raw file offset 0x{found_offset:X} (not inside a mapped section).")
+                self.jump_to_address(target_va)
+                self.status_bar.showMessage(f"Pattern found at 0x{target_va:08X}")
             else:
                 QMessageBox.information(self, "Pattern Search", "Pattern not found.")
         except Exception as e:
@@ -1537,85 +1883,83 @@ class GandonPRO(QMainWindow):
             self.pseudocode_view.decompile(self.blocks, self.current_va)
             self.status_bar.showMessage("Database loaded.")
 
-    # =====================================================================
-    #              ПАРСИНГ PE И БЕЗОПАСНАЯ ТОЧКА ВХОДА
-    # =====================================================================
-
     def open_file_dialog(self):
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Open Windows Binary", "", "Executables (*.exe *.dll *.sys);;All Files (*)"
+            self, "Open Binary", "", "Executables (*.exe *.dll *.so *.elf);;All Files (*)"
         )
         if file_path:
             self.load_binary(file_path)
 
-    def is_valid_executable_va(self, va: int) -> bool:
-        if not va or va <= self.image_base:
-            return False
-        rva = va - self.image_base
-        for sec in self.pe.sections:
-            v_size = getattr(sec, "Misc_VirtualSize", sec.SizeOfRawData)
-            if sec.VirtualAddress <= rva < sec.VirtualAddress + v_size:
-                return bool(sec.Characteristics & 0x20000000)
-        return False
-
-    def find_fallback_code_va(self) -> int:
-        for sec in self.pe.sections:
-            if sec.Characteristics & 0x20000000:
-                return self.image_base + sec.VirtualAddress
-        if self.pe.sections:
-            return self.image_base + self.pe.sections[0].VirtualAddress
-        return self.image_base
-
     def cache_strings(self):
         self.string_lookup.clear()
-        if not self.pe:
+        if not self.raw_data:
             return
         ascii_regex = re.compile(rb"[\x20-\x7E]{4,}")
-        for section in self.pe.sections:
-            try:
-                sec_data = section.get_data()
-                sec_rva = section.VirtualAddress
-                for match in ascii_regex.finditer(sec_data):
-                    va = self.image_base + sec_rva + match.start()
-                    self.string_lookup[va] = match.group().decode("ascii", errors="ignore")
-            except Exception:
-                continue
+        for match in ascii_regex.finditer(self.raw_data):
+            va = self.image_base + match.start()
+            self.string_lookup[va] = match.group().decode("ascii", errors="ignore")
 
     def load_binary(self, path: str):
+        self.current_binary_path = path
         try:
-            self.pe = pefile.PE(path, fast_load=False)
+            with open(path, "rb") as f:
+                self.raw_data = bytearray(f.read())
         except Exception as e:
-            self.status_bar.showMessage(f"PE Error: {str(e)}")
+            self.status_bar.showMessage(f"File Read Error: {e}")
             return
 
-        machine = getattr(self.pe.FILE_HEADER, "Machine", 0x8664)
-        if machine == 0x8664:
-            self.cs = Cs(CS_ARCH_X86, CS_MODE_64)
-            arch_str = "x86-64"
+        self.patch_history.clear()
+
+        if self.raw_data.startswith(b"MZ"):
+            self.is_elf = False
+            self.pe = pefile.PE(data=bytes(self.raw_data), fast_load=False)
+            machine = getattr(self.pe.FILE_HEADER, "Machine", 0x8664)
+            if machine == 0x8664:
+                self.cs = Cs(CS_ARCH_X86, CS_MODE_64)
+                arch_str = "x86-64"
+            else:
+                self.cs = Cs(CS_ARCH_X86, CS_MODE_32)
+                arch_str = "x86-32"
+
+            self.image_base = self.pe.OPTIONAL_HEADER.ImageBase
+            ep_rva = getattr(self.pe.OPTIONAL_HEADER, "AddressOfEntryPoint", 0)
+            entry_va = self.image_base + ep_rva if ep_rva else self.image_base
+
+        elif self.raw_data.startswith(b"\x7fELF"):
+            self.is_elf = True
+            self.pe = None
+            is_64 = self.raw_data[4] == 2
+            e_machine = struct.unpack("<H", self.raw_data[18:20])[0]
+
+            if e_machine == 0xB7:
+                self.cs = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+                arch_str = "ARM64"
+            elif e_machine == 0x28:
+                self.cs = Cs(CS_ARCH_ARM, CS_MODE_ARM)
+                arch_str = "ARM32"
+            else:
+                self.cs = Cs(CS_ARCH_X86, CS_MODE_64 if is_64 else CS_MODE_32)
+                arch_str = "x86-64" if is_64 else "x86-32"
+
+            self.image_base = 0x0
+            entry_va = struct.unpack("<Q" if is_64 else "<I", self.raw_data[24: 24 + (8 if is_64 else 4)])[0]
         else:
-            self.cs = Cs(CS_ARCH_X86, CS_MODE_32)
-            arch_str = "x86-32"
+            QMessageBox.critical(self, "Format Error", "Unrecognized binary header.")
+            return
+
         self.cs.detail = True
-
-        self.image_base = self.pe.OPTIONAL_HEADER.ImageBase
-        ep_rva = getattr(self.pe.OPTIONAL_HEADER, "AddressOfEntryPoint", 0)
-
-        entry_va = self.image_base + ep_rva if ep_rva else 0
-        if not self.is_valid_executable_va(entry_va):
-            entry_va = self.find_fallback_code_va()
-
-        self.status_bar.showMessage(f"Loaded: {os.path.basename(path)} | Arch: {arch_str} | Base: 0x{self.image_base:X}")
+        self.status_bar.showMessage(f"Loaded: {os.path.basename(path)} | {arch_str} | Base: 0x{self.image_base:X}")
 
         self.cache_strings()
         self.populate_navigation(entry_va)
 
-        self.hex_view.load_hex(self.pe, self.image_base, entry_va if entry_va else self.image_base)
-        self.imports_view.load_imports(self.pe)
-        self.exports_view.load_exports(self.pe, self.image_base)
-        self.strings_view.extract_strings(self.pe, self.image_base)
+        self.hex_view.load_hex(self.raw_data, self.image_base, entry_va)
+        if self.pe:
+            self.imports_view.load_imports(self.pe)
+            self.exports_view.load_exports(self.pe, self.image_base)
+        self.strings_view.extract_strings(self.raw_data, self.image_base)
 
-        if entry_va:
-            self.switch_to_gandon_view(entry_va)
+        self.switch_to_gandon_view(entry_va)
 
     def switch_to_gandon_view(self, target_va: int):
         self.tab_widget.setCurrentIndex(0)
@@ -1623,7 +1967,7 @@ class GandonPRO(QMainWindow):
 
     def build_cfg_graph(self, start_va: int, max_depth: int = 35):
         self.graph_view.clear_graph()
-        if not self.pe or not self.cs:
+        if not self.raw_data or not self.cs:
             return
 
         worklist = [start_va]
@@ -1637,15 +1981,11 @@ class GandonPRO(QMainWindow):
             if curr_va in visited:
                 continue
 
-            try:
-                offset = self.pe.get_offset_from_rva(curr_va - self.image_base)
-            except Exception:
+            offset = (curr_va - self.image_base) if self.is_elf else self.pe.get_offset_from_rva(curr_va - self.image_base)
+            if offset >= len(self.raw_data):
                 continue
 
-            if offset >= len(self.pe.__data__):
-                continue
-
-            raw = self.pe.__data__[offset: offset + 2048]
+            raw = bytes(self.raw_data[offset: offset + 2048])
             if not raw:
                 continue
 
@@ -1688,7 +2028,7 @@ class GandonPRO(QMainWindow):
                     except ValueError:
                         pass
 
-                if insn.group(X86_GRP_JUMP):
+                if insn.group(X86_GRP_JUMP) or insn.mnemonic in ("b", "bx"):
                     target = None
                     try:
                         if hasattr(insn, 'operands') and len(insn.operands) > 0:
@@ -1699,10 +2039,10 @@ class GandonPRO(QMainWindow):
                     except Exception:
                         target = None
 
-                    if insn.mnemonic == "jmp":
+                    if insn.mnemonic in ("jmp", "b"):
                         if target and target != curr_va:
                             self.edges.append((curr_va, target, "#569CD6", "uncond"))
-                            self.xrefs_db.setdefault(target, []).append(("Up", "Jump", insn.address, f"jmp loc_{target:08X}"))
+                            self.xrefs_db.setdefault(target, []).append(("Up", "Jump", insn.address, f"{insn.mnemonic} loc_{target:08X}"))
                             if target not in visited:
                                 worklist.append(target)
                     else:
@@ -1718,7 +2058,7 @@ class GandonPRO(QMainWindow):
                             worklist.append(fallthrough)
                     break
 
-                elif insn.group(X86_GRP_RET):
+                elif insn.group(X86_GRP_RET) or insn.mnemonic in ("ret", "bx lr"):
                     break
 
             if insns:
@@ -1740,7 +2080,6 @@ class GandonPRO(QMainWindow):
             temp_items[addr] = BasicBlockItem(addr, insns, 0, 0, self)
 
         curr_y = 0.0
-        coords = {}
         for lvl in sorted(layer_blocks.keys()):
             row_addrs = layer_blocks[lvl]
             row_heights = [temp_items[a].height for a in row_addrs]
@@ -1751,7 +2090,6 @@ class GandonPRO(QMainWindow):
 
             for a in row_addrs:
                 node = self.graph_view.add_node(a, self.blocks[a], curr_x, curr_y)
-                coords[a] = (curr_x, curr_y)
                 curr_x += node.width + 110
 
             curr_y += max_h + 100
@@ -1773,7 +2111,7 @@ class GandonPRO(QMainWindow):
         ep_item.setForeground(0, QColor("#4EC9B0"))
         self.nav_tree.addTopLevelItem(ep_item)
 
-        if hasattr(self.pe, "DIRECTORY_ENTRY_IMPORT"):
+        if self.pe and hasattr(self.pe, "DIRECTORY_ENTRY_IMPORT"):
             imp_root = QTreeWidgetItem(["Imports", ""])
             for entry in self.pe.DIRECTORY_ENTRY_IMPORT:
                 d_item = QTreeWidgetItem([entry.dll.decode(errors="ignore"), ""])
@@ -1784,12 +2122,14 @@ class GandonPRO(QMainWindow):
                 imp_root.addChild(d_item)
             self.nav_tree.addTopLevelItem(imp_root)
 
-        sec_root = QTreeWidgetItem(["Sections", ""])
-        for sec in self.pe.sections:
-            s_name = sec.Name.decode(errors="ignore").strip('\x00')
-            s_va = f"0x{(self.image_base + sec.VirtualAddress):08X}"
-            sec_root.addChild(QTreeWidgetItem([s_name, s_va]))
-        self.nav_tree.addTopLevelItem(sec_root)
+        if self.pe:
+            sec_root = QTreeWidgetItem(["Sections", ""])
+            for sec in self.pe.sections:
+                s_name = sec.Name.decode(errors="ignore").strip('\x00')
+                s_va = f"0x{(self.image_base + sec.VirtualAddress):08X}"
+                sec_root.addChild(QTreeWidgetItem([s_name, s_va]))
+            self.nav_tree.addTopLevelItem(sec_root)
+
         self.nav_tree.expandAll()
 
     def on_nav_item_clicked(self, item, col):
@@ -1797,11 +2137,57 @@ class GandonPRO(QMainWindow):
         if addr_str.startswith("0x"):
             self.jump_to_address(int(addr_str, 16))
 
+    def toggle_breakpoint(self, va):
+        if va in self.breakpoints:
+            self.breakpoints.remove(va)
+            self.status_bar.showMessage(f"Breakpoint removed: 0x{va:08X}")
+        else:
+            self.breakpoints.add(va)
+            self.status_bar.showMessage(f"Breakpoint added: 0x{va:08X}")
+
+        self.dbg_widget.bp_list.clear()
+        for bp in self.breakpoints:
+            self.dbg_widget.bp_list.addTopLevelItem(QTreeWidgetItem([f"0x{bp:08X}", "Software INT3"]))
+
+    def dbg_continue(self):
+        if not self.current_binary_path:
+            QMessageBox.warning(self, "Debugger", "Please load an executable (.exe) first via File -> Open.")
+            return
+
+        if not self.dbg.is_running:
+            if not self.current_binary_path.lower().endswith(".exe"):
+                QMessageBox.warning(self, "Debugger", "Win32 Debugger only supports launching .exe files.")
+                return
+            self.tab_widget.setCurrentIndex(3)
+            self.dbg.start_process(self.current_binary_path)
+        else:
+            if self.dbg.stealth_mode:
+                self.dbg.apply_stealth_hooks()
+            self.status_bar.showMessage("Continuing process execution...")
+
+    def dbg_stop(self):
+        self.dbg.stop()
+
+    def action_apply_antidebug(self):
+        success, msg = self.dbg.apply_stealth_hooks()
+        if success:
+            QMessageBox.information(self, "Anti-Debug Bypass", f"Applied successfully:\n\n{msg}")
+        else:
+            QMessageBox.warning(self, "Anti-Debug Bypass", msg)
+
+    def on_dbg_registers(self, regs):
+        self.dbg_widget.update_registers(regs)
+
+    def on_dbg_bp_hit(self, addr):
+        self.tab_widget.setCurrentIndex(0)
+        self.jump_to_address(addr)
+        QMessageBox.information(self, "Breakpoint", f"Breakpoint Hit at address: 0x{addr:08X}")
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    window = GandonPRO()
-    window.showMaximized()
+    win = GandonPRO()
+    win.showMaximized()
     app.processEvents()
-    window.show_about_dialog()
+    win.show_about_dialog()
     sys.exit(app.exec())
