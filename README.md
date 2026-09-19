@@ -32,7 +32,7 @@ Run on Windows with:
 python outputs\disassembler_working.py
 ```
 
-The main implementation is [`outputs/disassembler_working.py`](outputs/disassembler_working.py).
+The main implementation is [`outputs/GandonPro.py`](outputs/GandonPro.py).
 
 ## Main shortcuts
 
