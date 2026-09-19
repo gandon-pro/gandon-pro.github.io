@@ -1,355 +1,236 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Gandon-PRO: State-of-the-Art Binary Analysis</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <style>
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-        }
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Gandon-PRO is an interactive PE/ELF disassembler and Win32 debugger.">
+  <meta name="theme-color" content="#10b981">
+  <title>Gandon-PRO — Binary Analysis, Debugging and CFG</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --ink: #0f172a;
+      --muted: #4b5563;
+      --green: #059669;
+      --mint: #d1fae5;
+      --line: #dce7e2;
+      --surface: rgba(255, 255, 255, .9);
+      --shadow: 0 16px 45px rgba(6, 78, 59, .12);
+    }
 
-        body {
-            font-family: 'Inter', sans-serif;
-            background-color: #ffffff;
-            color: #111827;
-            -webkit-font-smoothing: antialiased;
-        }
-
-        /* Hero Container with Hex-Rays Gradient */
-        .hero-wrapper {
-            background: linear-gradient(135deg, #a7f3d0 0%, #6ee7b7 35%, #34d399 70%, #10b981 100%);
-            position: relative;
-            overflow: hidden;
-            border-bottom: 1px solid rgba(0, 0, 0, 0.05);
-        }
-
-        /* Portrait Backdrop in right corner */
-        .hero-portrait {
-            position: absolute;
-            right: 4%;
-            top: 50%;
-            transform: translateY(-40%);
-            width: 440px;
-            height: 440px;
-            border-radius: 50%;
-            background: url("https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSXUZJKTeH1k3qfSP61Rui3VuQrGMQ5zlMmmAz4F5x3NN1QRFZq") center/cover no-repeat;
-            opacity: 0.28;
-            filter: contrast(160%) grayscale(20%);
-            mix-blend-mode: multiply;
-            pointer-events: none;
-            mask-image: radial-gradient(circle, rgba(0,0,0,1) 40%, rgba(0,0,0,0) 75%);
-            -webkit-mask-image: radial-gradient(circle, rgba(0,0,0,1) 40%, rgba(0,0,0,0) 75%);
-        }
-
-        /* Header Navbar */
-        .nav-container {
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 24px 20px 0;
-            position: relative;
-            z-index: 10;
-        }
-
-        .navbar {
-            background: #ffffff;
-            border-radius: 12px;
-            padding: 10px 24px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.06);
-        }
-
-        .brand-logo {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            font-size: 20px;
-            font-weight: 800;
-            color: #052e16;
-            text-decoration: none;
-            letter-spacing: -0.5px;
-        }
-
-        .brand-icon {
-            background: #0f172a;
-            color: #34d399;
-            width: 32px;
-            height: 32px;
-            border-radius: 8px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 15px;
-            font-weight: 900;
-        }
-
-        .nav-links {
-            display: flex;
-            list-style: none;
-            gap: 28px;
-        }
-
-        .nav-links a {
-            text-decoration: none;
-            color: #374151;
-            font-size: 14px;
-            font-weight: 500;
-            transition: color 0.15s;
-        }
-
-        .nav-links a:hover {
-            color: #059669;
-        }
-
-        .account-btn {
-            background-color: #0f172a;
-            color: #ffffff;
-            padding: 9px 18px;
-            border-radius: 8px;
-            font-size: 13px;
-            font-weight: 600;
-            text-decoration: none;
-            transition: opacity 0.2s;
-        }
-
-        .account-btn:hover {
-            opacity: 0.9;
-        }
-
-        /* Hero Main Content */
-        .hero-content {
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 90px 20px 110px;
-            position: relative;
-            z-index: 5;
-        }
-
-        .hero-title {
-            font-size: 46px;
-            font-weight: 800;
-            line-height: 1.15;
-            color: #064e3b;
-            letter-spacing: -1.2px;
-            max-width: 620px;
-            margin-bottom: 24px;
-        }
-
-        .hero-subtitle {
-            font-size: 15px;
-            line-height: 1.65;
-            color: #065f46;
-            max-width: 530px;
-            margin-bottom: 36px;
-        }
-
-        .cta-group {
-            display: flex;
-            align-items: center;
-            gap: 20px;
-        }
-
-        .btn-primary {
-            background-color: #0f172a;
-            color: #ffffff;
-            padding: 13px 24px;
-            border-radius: 8px;
-            font-size: 14px;
-            font-weight: 600;
-            text-decoration: none;
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-            transition: transform 0.15s ease, background-color 0.15s ease;
-        }
-
-        .btn-primary:hover {
-            background-color: #1e293b;
-            transform: translateY(-1px);
-        }
-
-        .btn-link {
-            color: #064e3b;
-            font-size: 14px;
-            font-weight: 700;
-            text-decoration: none;
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-            transition: gap 0.2s;
-        }
-
-        .btn-link:hover {
-            gap: 10px;
-        }
-
-        /* News Cards Section */
-        .cards-section {
-            max-width: 1200px;
-            margin: 40px auto 70px;
-            padding: 0 20px;
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 28px;
-        }
-
-        .info-card {
-            border: 1px solid #e5e7eb;
-            border-radius: 12px;
-            padding: 28px;
-            background: #ffffff;
-            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.03);
-            display: flex;
-            flex-direction: column;
-            justify-content: space-between;
-        }
-
-        .badge {
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-            font-size: 12px;
-            font-weight: 600;
-            margin-bottom: 12px;
-        }
-
-        .badge-green {
-            color: #059669;
-        }
-
-        .badge-dot {
-            width: 7px;
-            height: 7px;
-            background-color: #10b981;
-            border-radius: 50%;
-        }
-
-        .card-heading {
-            font-size: 20px;
-            font-weight: 700;
-            color: #111827;
-            margin-bottom: 10px;
-        }
-
-        .card-text {
-            font-size: 14px;
-            line-height: 1.55;
-            color: #4b5563;
-            margin-bottom: 24px;
-        }
-
-        .card-btn {
-            background-color: #0f172a;
-            color: #ffffff;
-            align-self: flex-start;
-            padding: 10px 18px;
-            border-radius: 8px;
-            font-size: 13px;
-            font-weight: 600;
-            text-decoration: none;
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-        }
-
-        .card-btn.outline {
-            background-color: transparent;
-            color: #111827;
-            border: 1px solid #d1d5db;
-        }
-
-        .card-btn.outline:hover {
-            background-color: #f9fafb;
-        }
-
-        /* Bottom Section Header */
-        .bottom-title {
-            text-align: center;
-            font-size: 32px;
-            font-weight: 800;
-            color: #111827;
-            letter-spacing: -0.8px;
-            margin-bottom: 60px;
-        }
-
-        @media (max-width: 860px) {
-            .hero-portrait { display: none; }
-            .hero-title { font-size: 34px; }
-            .nav-links { display: none; }
-            .cards-section { grid-template-columns: 1fr; }
-        }
-    </style>
+    *, *::before, *::after { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      font-family: Inter, system-ui, sans-serif;
+      color: var(--ink);
+      background: #f8fbfa;
+      -webkit-font-smoothing: antialiased;
+    }
+    a { color: inherit; }
+    a:focus-visible, button:focus-visible {
+      outline: 3px solid #fbbf24;
+      outline-offset: 3px;
+    }
+    .hero {
+      position: relative;
+      overflow: hidden;
+      background: linear-gradient(135deg, #ecfdf5 0%, #a7f3d0 35%, #34d399 70%, #10b981 100%);
+      border-bottom: 1px solid rgba(6, 78, 59, .12);
+    }
+    .hero::after {
+      content: "";
+      position: absolute;
+      inset: auto -10% -130px 35%;
+      height: 260px;
+      background: rgba(255, 255, 255, .2);
+      transform: rotate(-8deg);
+      border-radius: 50%;
+      pointer-events: none;
+    }
+    .portrait {
+      position: absolute;
+      right: 4%;
+      top: 50%;
+      width: clamp(250px, 31vw, 440px);
+      aspect-ratio: 1;
+      transform: translateY(-40%);
+      border-radius: 50%;
+      background: url("https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSXUZJKTeH1k3qfSP61Rui3VuQrGMQ5zlMmmAz4F5x3NN1QRFZq") center/cover no-repeat;
+      opacity: .2;
+      filter: contrast(160%) grayscale(20%);
+      mix-blend-mode: multiply;
+      mask-image: radial-gradient(circle, #000 38%, transparent 74%);
+      pointer-events: none;
+    }
+    .container { width: min(1200px, calc(100% - 40px)); margin-inline: auto; }
+    .nav-wrap { position: relative; z-index: 2; padding-top: 24px; }
+    .navbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      padding: 10px 18px 10px 24px;
+      border: 1px solid rgba(255, 255, 255, .8);
+      border-radius: 14px;
+      background: var(--surface);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(12px);
+    }
+    .brand { display: inline-flex; align-items: center; gap: 10px; text-decoration: none; font-weight: 800; letter-spacing: -.5px; }
+    .brand-icon { display: grid; place-items: center; width: 34px; height: 34px; border-radius: 9px; color: #34d399; background: var(--ink); font-size: 14px; }
+    .nav-links { display: flex; align-items: center; gap: 24px; margin: 0; padding: 0; list-style: none; }
+    .nav-links a { color: #374151; font-size: 13px; font-weight: 600; text-decoration: none; }
+    .nav-links a:hover { color: var(--green); }
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      min-height: 42px;
+      padding: 0 18px;
+      border: 0;
+      border-radius: 9px;
+      background: var(--ink);
+      color: #fff;
+      font: inherit;
+      font-size: 13px;
+      font-weight: 700;
+      text-decoration: none;
+      cursor: pointer;
+      transition: transform .2s, background .2s, box-shadow .2s;
+    }
+    .button:hover { transform: translateY(-2px); background: #1e293b; box-shadow: 0 8px 20px rgba(15, 23, 42, .18); }
+    .menu-toggle { display: none; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: #fff; color: var(--ink); cursor: pointer; }
+    .hero-content { position: relative; z-index: 1; padding: 92px 0 116px; }
+    .eyebrow { display: inline-flex; align-items: center; gap: 8px; margin-bottom: 18px; color: #065f46; font-size: 12px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
+    .eyebrow::before { content: ""; width: 28px; height: 2px; background: #065f46; }
+    h1 { max-width: 680px; margin: 0 0 22px; color: #064e3b; font-size: clamp(2.35rem, 5vw, 4rem); line-height: 1.08; letter-spacing: -1.8px; }
+    .lead { max-width: 570px; margin: 0 0 32px; color: #065f46; font-size: 16px; line-height: 1.7; }
+    .cta { display: flex; align-items: center; flex-wrap: wrap; gap: 18px; }
+    .text-link { color: #064e3b; font-size: 14px; font-weight: 800; text-decoration: none; }
+    .text-link:hover { text-decoration: underline; }
+    .stats { display: flex; flex-wrap: wrap; gap: 24px; margin-top: 48px; }
+    .stat { min-width: 115px; }
+    .stat strong { display: block; color: #064e3b; font-size: 21px; }
+    .stat span { color: #047857; font-size: 12px; }
+    main { padding-bottom: 70px; }
+    .cards { display: grid; grid-template-columns: repeat(2, 1fr); gap: 24px; margin-top: -42px; position: relative; z-index: 3; }
+    .card { display: flex; flex-direction: column; justify-content: space-between; min-height: 260px; padding: 28px; border: 1px solid var(--line); border-radius: 14px; background: #fff; box-shadow: 0 12px 35px rgba(15, 23, 42, .07); }
+    .badge { display: inline-flex; align-items: center; gap: 7px; margin-bottom: 14px; color: var(--green); font-size: 12px; font-weight: 800; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #10b981; box-shadow: 0 0 0 4px #d1fae5; }
+    h2 { margin: 0; font-size: clamp(1.8rem, 3vw, 2.5rem); letter-spacing: -1px; }
+    h3 { margin: 0 0 10px; font-size: 20px; }
+    .card p, .feature p { color: var(--muted); font-size: 14px; line-height: 1.65; }
+    .card p { margin: 0 0 24px; }
+    .outline { background: #fff; color: var(--ink); border: 1px solid #cbd5e1; }
+    .outline:hover { background: #f8fafc; }
+    .section { padding-top: 92px; }
+    .section-heading { max-width: 620px; margin-bottom: 32px; }
+    .section-heading p { color: var(--muted); line-height: 1.7; }
+    .features { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+    .feature { padding: 22px; border: 1px solid var(--line); border-radius: 12px; background: #fff; }
+    .feature-icon { display: grid; place-items: center; width: 38px; height: 38px; margin-bottom: 16px; border-radius: 10px; background: var(--mint); color: var(--green); font-weight: 800; }
+    .feature p { margin: 0; }
+    footer { padding: 28px 0 36px; border-top: 1px solid var(--line); color: #64748b; font-size: 12px; }
+    footer .container { display: flex; justify-content: space-between; gap: 18px; }
+    @media (max-width: 860px) {
+      .portrait { opacity: .1; right: -80px; }
+      .nav-links, .navbar > .button { display: none; }
+      .menu-toggle { display: inline-flex; }
+      .navbar.is-open { flex-wrap: wrap; }
+      .navbar.is-open .nav-links { display: grid; flex-basis: 100%; gap: 14px; padding: 12px 0 6px; }
+      .hero-content { padding: 72px 0 95px; }
+      .cards, .features { grid-template-columns: 1fr; }
+      .cards { margin-top: 24px; }
+    }
+    @media (max-width: 520px) {
+      .container { width: min(100% - 28px, 1200px); }
+      .navbar { padding-inline: 14px; }
+      .hero-content { padding-top: 56px; }
+      .cta, footer .container { align-items: flex-start; flex-direction: column; }
+      .stats { gap: 16px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; }
+    }
+  </style>
 </head>
 <body>
-
-    <div class="hero-wrapper">
-        <div class="hero-portrait"></div>
-
-        <div class="nav-container">
-            <nav class="navbar">
-                <a href="#" class="brand-logo">
-                    <span class="brand-icon">&gt;_</span>
-                    gandon-pro
-                </a>
-                <ul class="nav-links">
-                    <li><a href="#">Products ▾</a></li>
-                    <li><a href="https://github.com/gandon-pro/gandon-pro.github.io/blob/main/GandonPro.py">Engine Architecture ▾</a></li>
-                    <li><a href="#">Documentation</a></li>
-                    <li><a href="#">Community</a></li>
-                    <li><a href="https://github.com/gandon-pro/gandon-pro.github.io/releases">Releases</a></li>
-                </ul>
-                <a href="https://github.com/gandon-pro/" class="account-btn">GitHub Profile</a>
-            </nav>
-        </div>
-
-        <div class="hero-content">
-            <h1 class="hero-title">Disassemble, inspect and route with Gandon-PRO</h1>
-            <p class="hero-subtitle">
-                Gandon-PRO is an interactive binary disassembly platform engineered with non-overlapping CFG generation, multi-path channel routing, and full PE analysis suite.
-            </p>
-            <div class="cta-group">
-                <a href="https://github.com/gandon-pro/gandon-pro.github.io/releases/download/v2.0-beta/GandonPro.exe" class="btn-primary">Download Now &rarr;</a>
-                <a href="https://github.com/gandon-pro/gandon-pro.github.io/blob/main/GandonPro.py" class="btn-link">Explore Architecture &rarr;</a>
-            </div>
-        </div>
+  <header class="hero" id="top">
+    <div class="portrait" aria-hidden="true"></div>
+    <div class="container nav-wrap">
+      <nav class="navbar" aria-label="Main navigation">
+        <a class="brand" href="#top" aria-label="Gandon-PRO home"><span class="brand-icon">&gt;_</span>gandon-pro</a>
+        <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="site-links">Menu</button>
+        <ul class="nav-links" id="site-links">
+          <li><a href="#features">Products</a></li>
+          <li><a href="https://github.com/gandon-pro/gandon-pro.github.io/blob/main/GandonPro.py">Architecture</a></li>
+          <li><a href="#docs">Documentation</a></li>
+          <li><a href="https://github.com/gandon-pro/gandon-pro.github.io/releases">Releases</a></li>
+        </ul>
+        <a class="button" href="https://github.com/gandon-pro/">GitHub Profile</a>
+      </nav>
     </div>
+    <div class="container hero-content">
+      <div class="eyebrow">Interactive binary analysis</div>
+      <h1>Disassemble, inspect and route with Gandon-PRO.</h1>
+      <p class="lead">An interactive PE/ELF disassembler and Win32 debugger with CFG visualization, symbol inspection, patching and practical debugging tools.</p>
+      <div class="cta">
+        <a class="button" href="https://github.com/gandon-pro/gandon-pro.github.io/releases/download/v2.0-beta/GandonPro.exe">Download now <span aria-hidden="true">→</span></a>
+        <a class="text-link" href="https://github.com/gandon-pro/gandon-pro.github.io/blob/main/GandonPro.py">Explore architecture <span aria-hidden="true">→</span></a>
+      </div>
+      <div class="stats" aria-label="Project highlights">
+        <div class="stat"><strong>PE / ELF</strong><span>format coverage</span></div>
+        <div class="stat"><strong>CFG + XREF</strong><span>navigation tools</span></div>
+        <div class="stat"><strong>Win32</strong><span>debugger backend</span></div>
+      </div>
+    </div>
+  </header>
 
-    <section class="cards-section">
-        <div class="info-card">
-            <div>
-                <div class="badge badge-green">
-                    <span class="badge-dot"></span> Latest update
-                </div>
-                <h3 class="card-heading">Gandon-PRO Release Beta 1.3!</h3>
-                <p class="card-text">
-                    Engineered with layer-assignment layout, orthogonal obstacle-avoidance arrow routing, and asynchronous resource management.
-                </p>
-            </div>
-            <a href="https://github.com/gandon-pro/gandon-pro.github.io/releases/tag/v2.0-beta" class="card-btn">Read the Release notes &rarr;</a>
+  <main>
+    <div class="container">
+      <section class="cards" aria-label="Latest project updates">
+        <article class="card">
+          <div><div class="badge"><span class="dot"></span>Latest update</div><h3>Gandon-PRO Beta</h3><p>Explore graph navigation, breakpoint workflows, symbol views and a focused dark IDE-style interface.</p></div>
+          <a class="button" href="https://github.com/gandon-pro/gandon-pro.github.io/releases/tag/v2.0-beta">Read release notes <span aria-hidden="true">→</span></a>
+        </article>
+        <article class="card">
+          <div><div class="badge"><span class="dot"></span>PE inspection core</div><h3>Disassembly &amp; CFG starter</h3><p>Inspect exports, references and function boundaries in x86-64 executable modules.</p></div>
+          <a class="button outline" href="https://github.com/gandon-pro/gandon-pro.github.io/blob/main/GandonPro.py">Inspect the source <span aria-hidden="true">→</span></a>
+        </article>
+      </section>
+
+      <section class="section" id="features">
+        <div class="section-heading"><h2>Built for a faster analysis loop.</h2><p>Keep the important context visible while moving from bytes to control flow, symbols and debugger state.</p></div>
+        <div class="features">
+          <article class="feature"><div class="feature-icon" aria-hidden="true">01</div><h3>Visual CFG</h3><p>Follow branches, calls and cross-references without losing the current function context.</p></article>
+          <article class="feature"><div class="feature-icon" aria-hidden="true">02</div><h3>Live debugging</h3><p>Use breakpoints, registers, memory, stepping and call-stack inspection from one workspace.</p></article>
+          <article class="feature"><div class="feature-icon" aria-hidden="true">03</div><h3>Patch with confidence</h3><p>Edit instructions, review changed bytes and export a patched binary when ready.</p></article>
         </div>
+      </section>
 
-        <div class="info-card">
-            <div>
-                <div class="badge badge-green">
-                    <span class="badge-dot"></span> PE Inspection Core
-                </div>
-                <h3 class="card-heading">Disassembly & CFG Starter</h3>
-                <p class="card-text">
-                    Inspect export directories, resolve indirect references, and trace function boundaries in x86-64 executable modules.
-                </p>
-            </div>
-            <a href="https://github.com/gandon-pro/gandon-pro.github.io/blob/main/GandonPro.py" class="card-btn outline">Start inspecting today &rarr;</a>
-        </div>
-    </section>
+      <section class="section" id="docs">
+        <div class="section-heading"><h2>Open and inspect.</h2><p>Read the implementation, download the latest build or follow the release history on GitHub.</p></div>
+        <div class="cta"><a class="button" href="https://github.com/gandon-pro/gandon-pro.github.io">Open repository <span aria-hidden="true">→</span></a><a class="text-link" href="https://github.com/gandon-pro/gandon-pro.github.io/releases">Browse releases <span aria-hidden="true">→</span></a></div>
+      </section>
+    </div>
+  </main>
 
-    <h2 class="bottom-title">What Makes Gandon-PRO the Ultimate Tool?</h2>
-
+  <footer><div class="container"><span>© 2026 Gandon-PRO Team</span><a href="#top">Back to top ↑</a></div></footer>
+  <script>
+    const menuButton = document.querySelector('.menu-toggle');
+    const navbar = document.querySelector('.navbar');
+    menuButton.addEventListener('click', () => {
+      const open = navbar.classList.toggle('is-open');
+      menuButton.setAttribute('aria-expanded', String(open));
+    });
+    document.querySelectorAll('.nav-links a').forEach(link => link.addEventListener('click', () => {
+      navbar.classList.remove('is-open');
+      menuButton.setAttribute('aria-expanded', 'false');
+    }));
+  </script>
 </body>
 </html>
