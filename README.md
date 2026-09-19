@@ -29,7 +29,7 @@ pyelftools        # optional: ELF symbols and DWARF section parsing
 Run on Windows with:
 
 ```powershell
-python outputs\disassembler_working.py
+python outputs\GandonPro.py
 ```
 
 The main implementation is [`outputs/GandonPro.py`](outputs/GandonPro.py).
