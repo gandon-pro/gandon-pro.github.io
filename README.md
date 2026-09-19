@@ -26,14 +26,6 @@ keystone-engine   # optional: instruction assembly/editing
 pyelftools        # optional: ELF symbols and DWARF section parsing
 ```
 
-Run on Windows with:
-
-```powershell
-python outputs\GandonPro.py
-```
-
-The main implementation is [`outputs/GandonPro.py`](outputs/GandonPro.py).
-
 ## Main shortcuts
 
 | Shortcut | Action |
@@ -57,5 +49,3 @@ The main implementation is [`outputs/GandonPro.py`](outputs/GandonPro.py).
 ## Verification
 
 The current source passes Python compilation, AST parsing, offscreen Qt UI smoke tests and real Windows x64 breakpoint/continue tests. WOW64/x86 context support is implemented through the native WOW64 context API.
-
-See [`CHANGELOG.md`](CHANGELOG.md) for the development history and [`CONVERSATION_HANDOFF.md`](CONVERSATION_HANDOFF.md) for continuation context.
