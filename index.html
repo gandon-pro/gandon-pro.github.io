@@ -5,6 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Gandon-PRO is an interactive PE/ELF disassembler and Win32 debugger.">
   <meta name="theme-color" content="#10b981">
+  <meta property="og:title" content="Gandon-PRO — Binary Analysis and Debugging">
+  <meta property="og:description" content="Interactive PE/ELF disassembly, CFG visualization and Win32 debugging tools.">
+  <meta property="og:type" content="website">
+  <meta name="twitter:card" content="summary">
   <title>Gandon-PRO — Binary Analysis, Debugging and CFG</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -19,6 +23,13 @@
       --surface: rgba(255, 255, 255, .9);
       --shadow: 0 16px 45px rgba(6, 78, 59, .12);
     }
+    [data-theme="dark"] {
+      --ink: #e5e7eb;
+      --muted: #a7b0bd;
+      --line: #334155;
+      --surface: rgba(15, 23, 42, .88);
+      --shadow: 0 16px 45px rgba(0, 0, 0, .24);
+    }
 
     *, *::before, *::after { box-sizing: border-box; }
     html { scroll-behavior: smooth; }
@@ -28,7 +39,14 @@
       color: var(--ink);
       background: #f8fbfa;
       -webkit-font-smoothing: antialiased;
+      transition: background-color .25s, color .25s;
     }
+    [data-theme="dark"] body { background: #111827; }
+    [data-theme="dark"] .card, [data-theme="dark"] .feature { background: #1e293b; border-color: var(--line); }
+    [data-theme="dark"] h2, [data-theme="dark"] h3, [data-theme="dark"] footer { color: #e5e7eb; }
+    [data-theme="dark"] .card p, [data-theme="dark"] .feature p { color: #cbd5e1; }
+    [data-theme="dark"] .nav-links a, [data-theme="dark"] .text-link { color: #d1fae5; }
+    [data-theme="dark"] .outline { background: #1e293b; color: #e5e7eb; border-color: #64748b; }
     a { color: inherit; }
     a:focus-visible, button:focus-visible {
       outline: 3px solid #fbbf24;
@@ -104,6 +122,8 @@
     }
     .button:hover { transform: translateY(-2px); background: #1e293b; box-shadow: 0 8px 20px rgba(15, 23, 42, .18); }
     .menu-toggle { display: none; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: #fff; color: var(--ink); cursor: pointer; }
+    .theme-toggle { min-height: 34px; padding: 0 11px; background: transparent; color: var(--ink); border: 1px solid var(--line); font-size: 12px; }
+    .theme-toggle:hover { background: rgba(255, 255, 255, .35); box-shadow: none; }
     .hero-content { position: relative; z-index: 1; padding: 92px 0 116px; }
     .eyebrow { display: inline-flex; align-items: center; gap: 8px; margin-bottom: 18px; color: #065f46; font-size: 12px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
     .eyebrow::before { content: ""; width: 28px; height: 2px; background: #065f46; }
@@ -171,7 +191,10 @@
           <li><a href="#docs">Documentation</a></li>
           <li><a href="https://github.com/gandon-pro/gandon-pro.github.io/releases">Releases</a></li>
         </ul>
-        <a class="button" href="https://github.com/gandon-pro/">GitHub Profile</a>
+        <div style="display:flex;align-items:center;gap:10px">
+          <button class="button theme-toggle" type="button" aria-label="Toggle color theme" aria-pressed="false">◐ Theme: Light</button>
+          <a class="button" href="https://github.com/gandon-pro/">GitHub Profile</a>
+        </div>
       </nav>
     </div>
     <div class="container hero-content">
@@ -179,7 +202,7 @@
       <h1>Disassemble, inspect and route with Gandon-PRO.</h1>
       <p class="lead">An interactive PE/ELF disassembler and Win32 debugger with CFG visualization, symbol inspection, patching and practical debugging tools.</p>
       <div class="cta">
-        <a class="button" href="https://github.com/gandon-pro/gandon-pro.github.io/releases/download/v2.1-beta/GandonPro.exe">Download now <span aria-hidden="true">→</span></a>
+        <a class="button" href="https://github.com/gandon-pro/gandon-pro.github.io/releases/download/v2.0-beta/GandonPro.exe">Download now <span aria-hidden="true">→</span></a>
         <a class="text-link" href="https://github.com/gandon-pro/gandon-pro.github.io/blob/main/GandonPro.py">Explore architecture <span aria-hidden="true">→</span></a>
       </div>
       <div class="stats" aria-label="Project highlights">
@@ -195,7 +218,7 @@
       <section class="cards" aria-label="Latest project updates">
         <article class="card">
           <div><div class="badge"><span class="dot"></span>Latest update</div><h3>Gandon-PRO Beta</h3><p>Explore graph navigation, breakpoint workflows, symbol views and a focused dark IDE-style interface.</p></div>
-          <a class="button" href="https://github.com/gandon-pro/gandon-pro.github.io/releases/tag/v2.1-beta">Read release notes <span aria-hidden="true">→</span></a>
+          <a class="button" href="https://github.com/gandon-pro/gandon-pro.github.io/releases/tag/v2.0-beta">Read release notes <span aria-hidden="true">→</span></a>
         </article>
         <article class="card">
           <div><div class="badge"><span class="dot"></span>PE inspection core</div><h3>Disassembly &amp; CFG starter</h3><p>Inspect exports, references and function boundaries in x86-64 executable modules.</p></div>
@@ -223,6 +246,20 @@
   <script>
     const menuButton = document.querySelector('.menu-toggle');
     const navbar = document.querySelector('.navbar');
+    const themeButton = document.querySelector('.theme-toggle');
+    const savedTheme = localStorage.getItem('gandon-theme');
+    const setThemeButtonState = (dark) => {
+      themeButton.textContent = dark ? '◐ Theme: Dark' : '◐ Theme: Light';
+      themeButton.setAttribute('aria-pressed', String(dark));
+    };
+    if (savedTheme === 'dark') document.documentElement.dataset.theme = 'dark';
+    setThemeButtonState(savedTheme === 'dark');
+    themeButton.addEventListener('click', () => {
+      const dark = document.documentElement.dataset.theme !== 'dark';
+      document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+      localStorage.setItem('gandon-theme', dark ? 'dark' : 'light');
+      setThemeButtonState(dark);
+    });
     menuButton.addEventListener('click', () => {
       const open = navbar.classList.toggle('is-open');
       menuButton.setAttribute('aria-expanded', String(open));
@@ -231,6 +268,12 @@
       navbar.classList.remove('is-open');
       menuButton.setAttribute('aria-expanded', 'false');
     }));
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape') {
+        navbar.classList.remove('is-open');
+        menuButton.setAttribute('aria-expanded', 'false');
+      }
+    });
   </script>
 </body>
 </html>
