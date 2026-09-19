@@ -2,14 +2,20 @@ import sys
 import os
 import re
 import json
+import csv
 import struct
 import threading
 import ctypes
+import importlib.util
 from ctypes import wintypes
 import urllib.request
 import pefile
 from capstone import Cs, CS_ARCH_X86, CS_ARCH_ARM, CS_ARCH_ARM64, CS_MODE_64, CS_MODE_32, CS_MODE_ARM
 from capstone.x86 import X86_GRP_JUMP, X86_GRP_CALL, X86_GRP_RET, X86_OP_MEM, X86_REG_RIP
+try:
+    from keystone import Ks, KS_ARCH_X86, KS_MODE_32, KS_MODE_64
+except ImportError:
+    Ks = None
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit,
@@ -23,7 +29,51 @@ from PyQt6.QtGui import (
     QFont, QColor, QAction, QKeySequence, QPen, QBrush,
     QPainter, QPainterPath, QPolygonF, QCursor, QPixmap, QIcon
 )
-from PyQt6.QtCore import Qt, QRectF, QPointF, pyqtSignal, QObject
+from PyQt6.QtCore import Qt, QRectF, QPointF, pyqtSignal, QObject, QEvent
+
+
+def apply_windows_dark_titlebar(widget):
+    """Enable the native dark title bar on Windows 10/11 when available."""
+    try:
+        dwmapi = ctypes.WinDLL("dwmapi")
+        dwmapi.DwmSetWindowAttribute.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32
+        ]
+        dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
+        # DWMWA_USE_IMMERSIVE_DARK_MODE (20; 19 on older Windows 10 builds).
+        use_dark = ctypes.c_int(1)
+        hwnd = int(widget.winId())
+        result = dwmapi.DwmSetWindowAttribute(
+            ctypes.c_void_p(hwnd), 20,
+            ctypes.byref(use_dark), ctypes.sizeof(use_dark)
+        )
+        if result != 0:
+            dwmapi.DwmSetWindowAttribute(
+                ctypes.c_void_p(hwnd), 19,
+                ctypes.byref(use_dark), ctypes.sizeof(use_dark)
+            )
+        # Match the content background (#1e1e1e) instead of the default
+        # almost-black dark title bar. DWMWA_CAPTION_COLOR is available on
+        # current Windows 11 builds and is harmless on older systems.
+        caption_color = ctypes.c_uint32(0x001E1E1E)
+        text_color = ctypes.c_uint32(0x00FFFFFF)
+        dwmapi.DwmSetWindowAttribute(
+            ctypes.c_void_p(hwnd), 35,
+            ctypes.byref(caption_color), ctypes.sizeof(caption_color)
+        )
+        dwmapi.DwmSetWindowAttribute(
+            ctypes.c_void_p(hwnd), 36,
+            ctypes.byref(text_color), ctypes.sizeof(text_color)
+        )
+    except Exception:
+        pass
+
+
+class DarkMessageBoxFilter(QObject):
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.Show and isinstance(watched, QDialog):
+            apply_windows_dark_titlebar(watched)
+        return False
 
 
 # =====================================================================
@@ -35,12 +85,18 @@ CREATE_NEW_CONSOLE = 0x00000010
 DBG_CONTINUE = 0x00010002
 DBG_EXCEPTION_NOT_HANDLED = 0x80010001
 EXCEPTION_DEBUG_EVENT = 1
+CREATE_THREAD_DEBUG_EVENT = 2
+EXIT_THREAD_DEBUG_EVENT = 4
+EXIT_PROCESS_DEBUG_EVENT = 5
 EXCEPTION_BREAKPOINT = 0x80000003
 EXCEPTION_SINGLE_STEP = 0x80000004
+THREAD_GET_CONTEXT = 0x0008
+THREAD_SET_CONTEXT = 0x0010
 CONTEXT_AMD64 = 0x00100000
 CONTEXT_CONTROL = CONTEXT_AMD64 | 0x1
 CONTEXT_INTEGER = CONTEXT_AMD64 | 0x2
 CONTEXT_FULL = CONTEXT_CONTROL | CONTEXT_INTEGER
+CONTEXT_DEBUG_REGISTERS = CONTEXT_AMD64 | 0x10
 
 PAGE_EXECUTE_READWRITE = 0x40
 
@@ -75,6 +131,33 @@ class CONTEXT64(ctypes.Structure):
         ("Xmm4", M128A), ("Xmm5", M128A), ("Xmm6", M128A), ("Xmm7", M128A),
         ("Xmm8", M128A), ("Xmm9", M128A), ("Xmm10", M128A), ("Xmm11", M128A),
         ("Xmm12", M128A), ("Xmm13", M128A), ("Xmm14", M128A), ("Xmm15", M128A),
+    ]
+
+
+class WOW64_FLOATING_SAVE(ctypes.Structure):
+    _fields_ = [("ControlWord", ctypes.c_uint32), ("StatusWord", ctypes.c_uint32),
+                ("TagWord", ctypes.c_uint32), ("ErrorOffset", ctypes.c_uint32),
+                ("ErrorSelector", ctypes.c_uint32), ("DataOffset", ctypes.c_uint32),
+                ("DataSelector", ctypes.c_uint32), ("RegisterArea", ctypes.c_ubyte * 80),
+                ("Cr0NpxState", ctypes.c_uint32)]
+
+
+class WOW64_CONTEXT(ctypes.Structure):
+    _fields_ = [
+        ("ContextFlags", ctypes.c_uint32),
+        ("Dr0", ctypes.c_uint32), ("Dr1", ctypes.c_uint32),
+        ("Dr2", ctypes.c_uint32), ("Dr3", ctypes.c_uint32),
+        ("Dr6", ctypes.c_uint32), ("Dr7", ctypes.c_uint32),
+        ("FloatSave", WOW64_FLOATING_SAVE),
+        ("SegGs", ctypes.c_uint32), ("SegFs", ctypes.c_uint32),
+        ("SegEs", ctypes.c_uint32), ("SegDs", ctypes.c_uint32),
+        ("Edi", ctypes.c_uint32), ("Esi", ctypes.c_uint32),
+        ("Ebx", ctypes.c_uint32), ("Edx", ctypes.c_uint32),
+        ("Ecx", ctypes.c_uint32), ("Eax", ctypes.c_uint32),
+        ("Ebp", ctypes.c_uint32), ("Eip", ctypes.c_uint32),
+        ("SegCs", ctypes.c_uint32), ("EFlags", ctypes.c_uint32),
+        ("Esp", ctypes.c_uint32), ("SegSs", ctypes.c_uint32),
+        ("ExtendedRegisters", ctypes.c_ubyte * 512),
     ]
 
 class EXCEPTION_RECORD(ctypes.Structure):
@@ -138,17 +221,34 @@ class DebuggerSignals(QObject):
     state_changed = pyqtSignal(str)
     registers_updated = pyqtSignal(dict)
     breakpoint_hit = pyqtSignal(int)
+    step_finished = pyqtSignal(int)
 
 class Win32Debugger:
     def __init__(self, signals):
         self.signals = signals
         self.k32 = ctypes.windll.kernel32
         self.ntdll = ctypes.windll.ntdll
+        self.psapi = ctypes.WinDLL("psapi")
         self.process_info = None
         self.is_running = False
         self.target_path = ""
+        self.target_is_64 = True
         self.worker_thread = None
         self.stealth_mode = True
+        self.stealth_applied = False
+        self.requested_breakpoints = set()
+        self.breakpoint_conditions = {}
+        self.requested_hardware_breakpoints = set()
+        self.hardware_breakpoints = {}
+        self.runtime_breakpoints = {}
+        self.pending_reinsert = None
+        self.resume_event = threading.Event()
+        self.resume_event.set()
+        self.thread_handles = {}
+        self.step_mode = False
+        self.paused_thread_id = None
+        self.step_over_runtime = None
+        self.last_registers = {}
 
         self.k32.CreateProcessW.argtypes = [
             wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.c_void_p,
@@ -161,11 +261,83 @@ class Win32Debugger:
         self.k32.WaitForDebugEvent.restype = wintypes.BOOL
         self.k32.ContinueDebugEvent.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.DWORD]
         self.k32.ContinueDebugEvent.restype = wintypes.BOOL
+        # API addresses and module handles are pointers.  Without explicit
+        # signatures ctypes treats their return values as 32-bit ints, which
+        # truncates them under 64-bit Python and makes every remote hook miss.
+        self.k32.GetModuleHandleA.argtypes = [wintypes.LPCSTR]
+        self.k32.GetModuleHandleA.restype = wintypes.HMODULE
+        self.k32.GetProcAddress.argtypes = [wintypes.HMODULE, wintypes.LPCSTR]
+        self.k32.GetProcAddress.restype = ctypes.c_void_p
+        self.k32.VirtualProtectEx.argtypes = [
+            wintypes.HANDLE, ctypes.c_void_p, ctypes.c_size_t,
+            wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)
+        ]
+        self.k32.VirtualProtectEx.restype = wintypes.BOOL
+        self.k32.WriteProcessMemory.argtypes = [
+            wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_size_t, ctypes.c_void_p
+        ]
+        self.k32.WriteProcessMemory.restype = wintypes.BOOL
+        self.k32.ReadProcessMemory.argtypes = [
+            wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_size_t, ctypes.c_void_p
+        ]
+        self.k32.ReadProcessMemory.restype = wintypes.BOOL
+        self.k32.GetThreadContext.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+        self.k32.GetThreadContext.restype = wintypes.BOOL
+        self.k32.SetThreadContext.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+        self.k32.SetThreadContext.restype = wintypes.BOOL
+        self.wow64_get_context = getattr(self.k32, "Wow64GetThreadContext", None)
+        self.wow64_set_context = getattr(self.k32, "Wow64SetThreadContext", None)
+        if self.wow64_get_context is not None:
+            self.wow64_get_context.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+            self.wow64_get_context.restype = wintypes.BOOL
+        if self.wow64_set_context is not None:
+            self.wow64_set_context.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+            self.wow64_set_context.restype = wintypes.BOOL
+        self.k32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        self.k32.OpenThread.restype = wintypes.HANDLE
+        # Toolhelp declarations are important on Win64: without restype,
+        # ctypes assumes a 32-bit integer and truncates the snapshot HANDLE.
+        self.k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        self.k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        self.k32.Module32FirstW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+        self.k32.Module32FirstW.restype = wintypes.BOOL
+        self.k32.Module32NextW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+        self.k32.Module32NextW.restype = wintypes.BOOL
+        self.k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        self.k32.CloseHandle.restype = wintypes.BOOL
+        self.psapi.EnumProcessModulesEx.argtypes = [
+            wintypes.HANDLE, ctypes.POINTER(wintypes.HMODULE), wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD), wintypes.DWORD
+        ]
+        self.psapi.EnumProcessModulesEx.restype = wintypes.BOOL
+        self.psapi.GetModuleBaseNameW.argtypes = [
+            wintypes.HANDLE, wintypes.HMODULE, wintypes.LPWSTR, wintypes.DWORD
+        ]
+        self.psapi.GetModuleBaseNameW.restype = wintypes.DWORD
 
     def start_process(self, path):
+        if self.is_running:
+            self.signals.state_changed.emit("Debugger is already running.")
+            return False
         self.target_path = path
+        self.stealth_applied = False
+        self.runtime_breakpoints.clear()
+        self.hardware_breakpoints.clear()
+        self.pending_reinsert = None
+        self.step_over_runtime = None
+        self.paused_thread_id = None
+        self.last_registers = {}
+        self.resume_event.set()
+        try:
+            probe = pefile.PE(path, fast_load=True)
+            self.target_is_64 = probe.FILE_HEADER.Machine == 0x8664
+        except Exception:
+            self.target_is_64 = True
         self.worker_thread = threading.Thread(target=self._run_debugger, daemon=True)
         self.worker_thread.start()
+        return True
 
     def _run_debugger(self):
         si = STARTUPINFOW()
@@ -186,6 +358,7 @@ class Win32Debugger:
 
         self.process_info = pi
         self.is_running = True
+        self.thread_handles = {pi.dwThreadId: pi.hThread}
         self.signals.state_changed.emit(f"Debugger attached: PID {pi.dwProcessId}")
 
         debug_event = DEBUG_EVENT()
@@ -195,49 +368,492 @@ class Win32Debugger:
             if not self.k32.WaitForDebugEvent(ctypes.byref(debug_event), 100):
                 continue
 
+            # A debug event is owned by this loop until ContinueDebugEvent is
+            # called exactly once for it.  In particular, never fall through
+            # to WaitForDebugEvent while a breakpoint event is still pending:
+            # that leaves the debuggee suspended forever and makes F9 look as
+            # if it worked while nothing actually continues.
             continue_status = DBG_CONTINUE
+            wait_for_user = False
+            event_pid = debug_event.dwProcessId
+            event_tid = debug_event.dwThreadId
+
+            if debug_event.dwDebugEventCode == CREATE_THREAD_DEBUG_EVENT:
+                thread_id = debug_event.dwThreadId
+                if thread_id not in self.thread_handles:
+                    handle = self.k32.OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, False, thread_id)
+                    if handle:
+                        self.thread_handles[thread_id] = handle
+                        self._install_requested_hardware_breakpoints(handle)
+
+            if debug_event.dwDebugEventCode == EXIT_THREAD_DEBUG_EVENT:
+                thread_id = debug_event.dwThreadId
+                handle = self.thread_handles.pop(thread_id, None)
+                if handle and handle != pi.hThread:
+                    self.k32.CloseHandle(handle)
+
+            if debug_event.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT:
+                self.is_running = False
+                self.runtime_breakpoints.clear()
+                self.pending_reinsert = None
+                self.step_over_runtime = None
+                self.paused_thread_id = None
+                # Acknowledge the exit event while the debug event is still
+                # valid.  Only then release the handles held by this object.
+                self.k32.ContinueDebugEvent(event_pid, event_tid, DBG_CONTINUE)
+                if self.process_info:
+                    self.k32.CloseHandle(self.process_info.hProcess)
+                    self.k32.CloseHandle(self.process_info.hThread)
+                    self.process_info = None
+                self.thread_handles.clear()
+                self.signals.state_changed.emit("Debug process exited.")
+                continue
 
             if debug_event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT:
+                thread_handle = self.thread_handles.get(
+                    debug_event.dwThreadId, pi.hThread
+                )
                 code = debug_event.u.Exception.ExceptionRecord.ExceptionCode
                 addr = debug_event.u.Exception.ExceptionRecord.ExceptionAddress
 
-                if self.stealth_mode:
+                if self.stealth_mode and not self.stealth_applied:
                     self.apply_stealth_hooks()
 
                 if code == EXCEPTION_BREAKPOINT:
                     if first_bp:
                         first_bp = False
+                        self._install_requested_breakpoints()
+                        self._install_requested_hardware_breakpoints(thread_handle)
                         self.signals.state_changed.emit("Stealth mode active: PEB & API hooks applied.")
-                        self._read_context(pi.hThread)
+                        # On some WOW64 systems the initial debug exception is
+                        # delivered at the image entry point itself. If a user
+                        # breakpoint was installed there, do not discard that
+                        # first event as a loader trap.
+                        initial_runtime = int(addr or 0)
+                        initial_hit = self.runtime_breakpoints.get(initial_runtime)
+                        if initial_hit:
+                            original, user_va = initial_hit
+                            self._write_byte(initial_runtime, original)
+                            resume_at = initial_runtime + 1 if original == 0xCC else initial_runtime
+                            self._prepare_single_step(thread_handle, resume_at)
+                            self.pending_reinsert = (initial_runtime, original)
+                            self.resume_event.clear()
+                            self.paused_thread_id = event_tid
+                            wait_for_user = True
+                            self.signals.breakpoint_hit.emit(user_va)
+                        else:
+                            self._read_context(thread_handle)
                     else:
-                        self.signals.breakpoint_hit.emit(addr or 0)
-                        self._read_context(pi.hThread)
+                        hit_runtime = int(addr or 0)
+                        if self.step_over_runtime and hit_runtime == self.step_over_runtime[0]:
+                            temp_addr, temp_original, temp_static = self.step_over_runtime
+                            self._write_byte(temp_addr, temp_original)
+                            self._set_context_rip(thread_handle, temp_addr, trap=False)
+                            self.step_over_runtime = None
+                            self.step_mode = False
+                            self.pending_reinsert = None
+                            self.resume_event.clear()
+                            self.paused_thread_id = event_tid
+                            wait_for_user = True
+                            # The UI converts runtime addresses back to the
+                            # static image VA. Emit the runtime address here;
+                            # passing temp_static would apply ASLR conversion
+                            # twice when image and runtime bases coincide.
+                            self.signals.step_finished.emit(temp_addr)
+                            self._read_context(thread_handle)
+                            continue_status = DBG_CONTINUE
+                            # Do not treat the temporary step-over trap as a
+                            # user breakpoint and do not show a popup.
+                            hit_runtime = 0
+                        if not hit_runtime:
+                            pass
+                        else:
+                            hit = self.runtime_breakpoints.get(hit_runtime)
+                            if hit:
+                                original, user_va = hit
+                                self._write_byte(hit_runtime, original)
+                                # If the original byte was already INT3, this is
+                                # a native breakpoint rather than an instruction
+                                # replaced by our F2 point. Skip it instead of
+                                # restoring RIP to the same trap forever.
+                                resume_at = hit_runtime + 1 if original == 0xCC else hit_runtime
+                                self._prepare_single_step(thread_handle, resume_at)
+                                self.pending_reinsert = (hit_runtime, original)
+                                condition = self.breakpoint_conditions.get(user_va, "").strip()
+                                if condition and not self._condition_matches(thread_handle, condition):
+                                    # Conditional breakpoint did not match: keep the
+                                    # one-instruction reinsertion dance, but do not
+                                    # stop the target or show a false hit popup.
+                                    self.signals.state_changed.emit(
+                                        f"Conditional breakpoint skipped at 0x{user_va:X} ({condition})."
+                                    )
+                                else:
+                                    self.resume_event.clear()
+                                    self.paused_thread_id = event_tid
+                                    wait_for_user = True
+                                    self.signals.breakpoint_hit.emit(user_va)
+                            else:
+                                # Do not turn an unregistered/native INT3 into a
+                                # fake user breakpoint. Initial loader/runtime
+                                # traps and embedded INT3 instructions are not
+                                # breakpoints created through the F2 UI.
+                                self.signals.state_changed.emit(
+                                    f"Ignored unregistered INT3 at runtime 0x{hit_runtime:X}."
+                                )
+                            self._read_context(thread_handle)
 
                 elif code == EXCEPTION_SINGLE_STEP:
-                    self._read_context(pi.hThread)
+                    hardware_hit = self._hardware_breakpoint_hit(thread_handle)
+                    if hardware_hit is None and self.hardware_breakpoints:
+                        # Some Windows builds report an execute debug-register
+                        # trap with a cleared DR6 in the debug event payload.
+                        # ExceptionAddress is still the precise instruction
+                        # address, so use it as a reliable fallback.
+                        for runtime, info in self.hardware_breakpoints.items():
+                            if int(addr or 0) == runtime:
+                                hardware_hit = info[1]
+                                break
+                    if self.pending_reinsert:
+                        bp_addr, original = self.pending_reinsert
+                        self._write_byte(bp_addr, 0xCC)
+                        self.pending_reinsert = None
+                    self._read_context(thread_handle)
+                    if self.step_mode:
+                        self.step_mode = False
+                        self.paused_thread_id = event_tid
+                        self.resume_event.clear()
+                        wait_for_user = True
+                        self.signals.step_finished.emit(int(addr or 0))
+                    elif hardware_hit is not None:
+                        self.resume_event.clear()
+                        self.paused_thread_id = event_tid
+                        wait_for_user = True
+                        self.signals.breakpoint_hit.emit(hardware_hit)
 
-            self.k32.ContinueDebugEvent(
-                debug_event.dwProcessId,
-                debug_event.dwThreadId,
+            if wait_for_user:
+                # The debuggee is intentionally stopped at the breakpoint.
+                # F9 sets this event.  The current DEBUG_EVENT is then
+                # continued below, which is the operation that actually
+                # releases the Windows debuggee.
+                self.resume_event.wait()
+                if not self.is_running:
+                    break
+
+            continued = self.k32.ContinueDebugEvent(
+                event_pid,
+                event_tid,
                 continue_status
             )
+            if not continued:
+                self.signals.state_changed.emit(
+                    f"ContinueDebugEvent failed: Win32 error {self.k32.GetLastError()}"
+                )
+            elif self.pending_reinsert is None:
+                self.signals.state_changed.emit("Debug event continued.")
+            if wait_for_user and continued:
+                self.paused_thread_id = None
+
+    def set_user_breakpoint(self, va, image_base):
+        self.requested_breakpoints.add((va, image_base))
+        if self.is_running:
+            ok = self._install_breakpoint(va, image_base)
+            if not ok:
+                self.signals.state_changed.emit(
+                    f"Breakpoint install failed at 0x{va:X}; Win32 error {self.k32.GetLastError()}"
+                )
+            return ok
+        return True
+
+    def set_breakpoint_condition(self, va, expression):
+        expression = (expression or "").strip()
+        if expression:
+            self.breakpoint_conditions[int(va)] = expression
+        else:
+            self.breakpoint_conditions.pop(int(va), None)
+
+    def set_hardware_breakpoint(self, va, image_base):
+        """Request an execute hardware breakpoint using an available DR slot."""
+        point = (int(va), int(image_base))
+        self.requested_hardware_breakpoints.add(point)
+        if not self.is_running:
+            return True
+        ok = False
+        for handle in list(self.thread_handles.values()):
+            ok = self._install_hardware_breakpoint(va, image_base, handle) or ok
+        if not ok:
+            self.signals.state_changed.emit("No paused thread available for a hardware breakpoint.")
+        return ok
+
+    def remove_hardware_breakpoint(self, va, image_base):
+        self.requested_hardware_breakpoints.discard((int(va), int(image_base)))
+        for runtime, info in list(self.hardware_breakpoints.items()):
+            if info[1] == int(va):
+                self._clear_hardware_slot(info[0])
+                self.hardware_breakpoints.pop(runtime, None)
+
+    def remove_user_breakpoint(self, va, image_base):
+        self.requested_breakpoints.discard((va, image_base))
+        for runtime, (original, saved_va) in list(self.runtime_breakpoints.items()):
+            if saved_va == va:
+                self._write_byte(runtime, original)
+                del self.runtime_breakpoints[runtime]
+                if self.pending_reinsert and self.pending_reinsert[0] == runtime:
+                    # The current stop may be waiting for a single-step.  Do
+                    # not let that single-step put a deleted breakpoint back.
+                    self.pending_reinsert = None
+                return True
+        return True
+
+    def _install_requested_breakpoints(self):
+        for va, image_base in list(self.requested_breakpoints):
+            self._install_breakpoint(va, image_base)
+
+    def _install_requested_hardware_breakpoints(self, thread_handle):
+        for va, image_base in list(self.requested_hardware_breakpoints):
+            self._install_hardware_breakpoint(va, image_base, thread_handle)
+
+    def _install_hardware_breakpoint(self, va, image_base, h_thread):
+        if not self.process_info or not h_thread:
+            return False
+        module = self._remote_module_base(os.path.basename(self.target_path))
+        if not module:
+            return False
+        runtime = module + (int(va) - int(image_base))
+        if runtime in self.hardware_breakpoints:
+            return True
+        ctx = CONTEXT64() if self.target_is_64 else WOW64_CONTEXT()
+        ctx.ContextFlags = (CONTEXT_FULL | CONTEXT_DEBUG_REGISTERS) if self.target_is_64 else 0x00010007
+        if not self._get_thread_context(h_thread, ctx):
+            return False
+        used = {info[0] for info in self.hardware_breakpoints.values()}
+        slot = next((candidate for candidate in range(4) if candidate not in used), None)
+        if slot is None:
+            self.signals.state_changed.emit("Hardware breakpoint limit reached (4 slots).")
+            return False
+        setattr(ctx, f"Dr{slot}", runtime)
+        ctx.Dr7 |= (1 << (slot * 2))  # local enable, execute/length 1 byte
+        ctx.Dr7 &= ~(0xF << (16 + slot * 4))
+        ctx.Dr6 = 0
+        if not self._set_thread_context(h_thread, ctx):
+            return False
+        self.hardware_breakpoints[runtime] = (slot, int(va), int(image_base))
+        self.signals.state_changed.emit(f"Hardware breakpoint installed: 0x{int(va):X}")
+        return True
+
+    def _clear_hardware_slot(self, slot):
+        for handle in list(self.thread_handles.values()):
+            ctx = CONTEXT64() if self.target_is_64 else WOW64_CONTEXT()
+            ctx.ContextFlags = (CONTEXT_FULL | CONTEXT_DEBUG_REGISTERS) if self.target_is_64 else 0x00010007
+            if self._get_thread_context(handle, ctx):
+                ctx.Dr7 &= ~(1 << (slot * 2))
+                setattr(ctx, f"Dr{slot}", 0)
+                self._set_thread_context(handle, ctx)
+
+    def _hardware_breakpoint_hit(self, h_thread):
+        if not self.hardware_breakpoints or not h_thread:
+            return None
+        ctx = CONTEXT64() if self.target_is_64 else WOW64_CONTEXT()
+        ctx.ContextFlags = (CONTEXT_FULL | CONTEXT_DEBUG_REGISTERS) if self.target_is_64 else 0x00010007
+        if not self._get_thread_context(h_thread, ctx):
+            return None
+        for runtime, info in self.hardware_breakpoints.items():
+            if ctx.Dr6 & (1 << info[0]):
+                ctx.Dr6 = 0
+                self._set_thread_context(h_thread, ctx)
+                return info[1]
+        return None
+
+    def _condition_matches(self, h_thread, expression):
+        """Evaluate a deliberately small, safe register condition language."""
+        ctx = CONTEXT64() if self.target_is_64 else WOW64_CONTEXT()
+        ctx.ContextFlags = (CONTEXT_FULL | CONTEXT_DEBUG_REGISTERS) if self.target_is_64 else 0x00010007
+        if not self._get_thread_context(h_thread, ctx):
+            return False
+        if self.target_is_64:
+            regs = {name: int(getattr(ctx, name.title(), 0))
+                    for name in ("rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rsp", "rbp", "rip")}
+        else:
+            regs = {name: int(getattr(ctx, {"eax": "Eax", "ebx": "Ebx", "ecx": "Ecx", "edx": "Edx", "esi": "Esi", "edi": "Edi", "esp": "Esp", "ebp": "Ebp", "eip": "Eip"}[name], 0))
+                    for name in ("eax", "ebx", "ecx", "edx", "esi", "edi", "esp", "ebp", "eip")}
+        match = re.fullmatch(r"\s*([A-Za-z][A-Za-z0-9]*)\s*(==|!=|<=|>=|<|>)\s*(0x[0-9a-fA-F]+|[0-9]+)\s*", expression)
+        if not match:
+            self.signals.state_changed.emit("Condition syntax: REG == 0x123 (also !=, <, <=, >, >=).")
+            return False
+        left, op, right = match.groups()
+        key = left.lower()
+        if key not in regs:
+            return False
+        rhs = int(right, 0)
+        lhs = regs[key]
+        return {"==": lhs == rhs, "!=": lhs != rhs, "<": lhs < rhs,
+                "<=": lhs <= rhs, ">": lhs > rhs, ">=": lhs >= rhs}[op]
+
+    def _install_breakpoint(self, va, image_base):
+        if not self.process_info:
+            return False
+        module = self._remote_module_base(os.path.basename(self.target_path))
+        if not module:
+            self.signals.state_changed.emit(
+                f"Breakpoint failed: target module not found ({os.path.basename(self.target_path)})"
+            )
+            return False
+        runtime = module + (va - image_base)
+        if runtime in self.runtime_breakpoints:
+            return True
+        original = ctypes.c_ubyte()
+        if not self.k32.ReadProcessMemory(
+            self.process_info.hProcess, ctypes.c_void_p(runtime),
+            ctypes.byref(original), 1, None
+        ):
+            self.signals.state_changed.emit(
+                f"Breakpoint read failed at 0x{runtime:X}; Win32 error {self.k32.GetLastError()}"
+            )
+            return False
+        if not self._write_byte(runtime, 0xCC):
+            self.signals.state_changed.emit(
+                f"Breakpoint write failed at 0x{runtime:X}; Win32 error {self.k32.GetLastError()}"
+            )
+            return False
+        self.runtime_breakpoints[runtime] = (original.value, va)
+        self.signals.state_changed.emit(
+            f"Breakpoint installed: VA 0x{va:X} -> runtime 0x{runtime:X}"
+        )
+        return True
+
+    def _write_byte(self, address, value):
+        data = (ctypes.c_ubyte * 1)(value)
+        old_protection = wintypes.DWORD()
+        process = self.process_info.hProcess
+        if not self.k32.VirtualProtectEx(
+            process, ctypes.c_void_p(address), 1,
+            PAGE_EXECUTE_READWRITE, ctypes.byref(old_protection)
+        ):
+            return False
+        try:
+            written = bool(self.k32.WriteProcessMemory(
+                process, ctypes.c_void_p(address), data, 1, None
+            ))
+            if not written:
+                return False
+            verify = ctypes.c_ubyte()
+            return bool(self.k32.ReadProcessMemory(
+                process, ctypes.c_void_p(address), ctypes.byref(verify), 1, None
+            )) and verify.value == value
+        finally:
+            self.k32.VirtualProtectEx(
+                process, ctypes.c_void_p(address), 1,
+                old_protection.value, ctypes.byref(old_protection)
+            )
+
+    def _get_thread_context(self, h_thread, context):
+        if self.target_is_64:
+            return bool(self.k32.GetThreadContext(h_thread, ctypes.byref(context)))
+        return bool(self.wow64_get_context and self.wow64_get_context(h_thread, ctypes.byref(context)))
+
+    def _set_thread_context(self, h_thread, context):
+        if self.target_is_64:
+            return bool(self.k32.SetThreadContext(h_thread, ctypes.byref(context)))
+        return bool(self.wow64_set_context and self.wow64_set_context(h_thread, ctypes.byref(context)))
+
+    def _prepare_single_step(self, h_thread, resume_address):
+        ctx = CONTEXT64() if self.target_is_64 else WOW64_CONTEXT()
+        ctx.ContextFlags = CONTEXT_FULL if self.target_is_64 else 0x00010007
+        if not self._get_thread_context(h_thread, ctx):
+            return False
+        if self.target_is_64:
+            ctx.Rip = resume_address
+        else:
+            ctx.Eip = int(resume_address) & 0xFFFFFFFF
+        ctx.EFlags |= 0x100
+        return self._set_thread_context(h_thread, ctx)
+
+    def _set_context_rip(self, h_thread, address, trap=False):
+        ctx = CONTEXT64() if self.target_is_64 else WOW64_CONTEXT()
+        ctx.ContextFlags = CONTEXT_FULL if self.target_is_64 else 0x00010007
+        if not self._get_thread_context(h_thread, ctx):
+            return False
+        if self.target_is_64:
+            ctx.Rip = int(address)
+        else:
+            ctx.Eip = int(address) & 0xFFFFFFFF
+        if trap:
+            ctx.EFlags |= 0x100
+        else:
+            ctx.EFlags &= ~0x100
+        return self._set_thread_context(h_thread, ctx)
 
     def _read_context(self, h_thread):
-        ctx = CONTEXT64()
-        ctx.ContextFlags = CONTEXT_FULL
-        if self.k32.GetThreadContext(h_thread, ctypes.byref(ctx)):
-            regs = {
-                "RAX": hex(ctx.Rax), "RBX": hex(ctx.Rbx),
-                "RCX": hex(ctx.Rcx), "RDX": hex(ctx.Rdx),
-                "RSI": hex(ctx.Rsi), "RDI": hex(ctx.Rdi),
-                "RSP": hex(ctx.Rsp), "RBP": hex(ctx.Rbp),
-                "RIP": hex(ctx.Rip), "EFLAGS": hex(ctx.EFlags)
-            }
+        ctx = CONTEXT64() if self.target_is_64 else WOW64_CONTEXT()
+        ctx.ContextFlags = CONTEXT_FULL if self.target_is_64 else 0x00010007
+        if self._get_thread_context(h_thread, ctx):
+            if self.target_is_64:
+                regs = {
+                    "RAX": hex(ctx.Rax), "RBX": hex(ctx.Rbx),
+                    "RCX": hex(ctx.Rcx), "RDX": hex(ctx.Rdx),
+                    "RSI": hex(ctx.Rsi), "RDI": hex(ctx.Rdi),
+                    "RSP": hex(ctx.Rsp), "RBP": hex(ctx.Rbp),
+                    "RIP": hex(ctx.Rip), "EFLAGS": hex(ctx.EFlags)
+                }
+            else:
+                regs = {
+                    "EAX": hex(ctx.Eax), "EBX": hex(ctx.Ebx),
+                    "ECX": hex(ctx.Ecx), "EDX": hex(ctx.Edx),
+                    "ESI": hex(ctx.Esi), "EDI": hex(ctx.Edi),
+                    "ESP": hex(ctx.Esp), "EBP": hex(ctx.Ebp),
+                    "EIP": hex(ctx.Eip), "EFLAGS": hex(ctx.EFlags)
+                }
+            self.last_registers = regs
             self.signals.registers_updated.emit(regs)
+
+    def frame_rows(self, count=32):
+        """Walk a conventional RBP chain when frame pointers are present."""
+        try:
+            is64 = self.target_is_64
+            rbp = int(self.last_registers.get("RBP" if is64 else "EBP", "0"), 16)
+        except (TypeError, ValueError):
+            return []
+        rows = []
+        seen = set()
+        word_size = 8 if self.target_is_64 else 4
+        for index in range(max(1, int(count))):
+            if not rbp or rbp in seen or rbp % 8:
+                break
+            data = self.read_memory(rbp, word_size * 2)
+            if len(data) < word_size * 2:
+                break
+            previous = int.from_bytes(data[:word_size], "little")
+            ret = int.from_bytes(data[word_size:word_size * 2], "little")
+            rows.append((index, rbp, ret))
+            seen.add(rbp)
+            if previous <= rbp or previous - rbp > 0x100000:
+                break
+            rbp = previous
+        return rows
+
+    def thread_rows(self):
+        paused = self.paused_thread_id
+        return [(tid, "paused" if tid == paused else "running")
+                for tid in sorted(self.thread_handles)]
+
+    def stack_rows(self, count=32):
+        try:
+            rsp = int(self.last_registers.get("RSP" if self.target_is_64 else "ESP", "0"), 16)
+        except (TypeError, ValueError):
+            return []
+        word_size = 8 if self.target_is_64 else 4
+        data = self.read_memory(rsp, count * word_size)
+        rows = []
+        for offset in range(0, len(data) - word_size + 1, word_size):
+            value = int.from_bytes(data[offset:offset + word_size], "little")
+            rows.append((rsp + offset, value))
+        return rows
 
     def apply_stealth_hooks(self):
         if not self.process_info or not self.is_running:
             return False, "Target process is not running."
+        # Do not short-circuit here.  A previous pass may have been partial,
+        # or the target may have loaded another copy of a system DLL.  Every
+        # explicit Apply action must perform a fresh write/read-back check.
 
         h_proc = self.process_info.hProcess
         pbi = PROCESS_BASIC_INFORMATION()
@@ -259,30 +875,195 @@ class Win32Debugger:
         patch = (ctypes.c_ubyte * 3)(0x31, 0xC0, 0xC3)
         old_prot = ctypes.c_uint32()
 
-        for mod_name in [b"kernel32.dll", b"kernelbase.dll"]:
-            h_mod = self.k32.GetModuleHandleA(mod_name)
-            if h_mod:
-                p_func = self.k32.GetProcAddress(h_mod, b"IsDebuggerPresent")
-                if p_func:
-                    self.k32.VirtualProtectEx(h_proc, ctypes.c_void_p(p_func), 3, PAGE_EXECUTE_READWRITE, ctypes.byref(old_prot))
-                    self.k32.WriteProcessMemory(h_proc, ctypes.c_void_p(p_func), patch, 3, None)
-                    self.k32.VirtualProtectEx(h_proc, ctypes.c_void_p(p_func), 3, old_prot.value, ctypes.byref(old_prot))
+        # Patch both the kernel32 forwarding stub and the kernelbase
+        # implementation.  ctypes commonly calls the kernel32 stub directly
+        # (48 FF 25 ... on x64), so patching kernelbase alone is insufficient.
+        patched = 0
+        for module_name in ("kernel32.dll", "kernelbase.dll"):
+            patched += self._patch_remote_export(
+                module_name, "IsDebuggerPresent", patch, old_prot
+            )
 
-        h_k32 = self.k32.GetModuleHandleA(b"kernel32.dll")
-        p_chk = self.k32.GetProcAddress(h_k32, b"CheckRemoteDebuggerPresent")
-        if p_chk:
-            patch_chk = (ctypes.c_ubyte * 7)(0xC7, 0x02, 0x00, 0x00, 0x00, 0x00, 0xC3)
-            self.k32.VirtualProtectEx(h_proc, ctypes.c_void_p(p_chk), 7, PAGE_EXECUTE_READWRITE, ctypes.byref(old_prot))
-            self.k32.WriteProcessMemory(h_proc, ctypes.c_void_p(p_chk), patch_chk, 7, None)
-            self.k32.VirtualProtectEx(h_proc, ctypes.c_void_p(p_chk), 7, old_prot.value, ctypes.byref(old_prot))
+        # CheckRemoteDebuggerPresent writes through its second argument.  The
+        # argument location and return convention differ between x64 and x86.
+        if self.target_is_64:
+            # RDX points to the BOOL; return value is in RAX.
+            patch_chk = (ctypes.c_ubyte * 7)(
+                0xC7, 0x02, 0x00, 0x00, 0x00, 0x00, 0xC3
+            )
+        else:
+            # [ESP+8] is the second stdcall argument; pop two arguments.
+            patch_chk = (ctypes.c_ubyte * 11)(
+                0xC7, 0x44, 0x24, 0x08, 0x00, 0x00, 0x00, 0x00,
+                0xC2, 0x08, 0x00
+            )
+        for module_name in ("kernel32.dll", "kernelbase.dll"):
+            patched += self._patch_remote_export(
+                module_name, "CheckRemoteDebuggerPresent", patch_chk, old_prot
+            )
 
-        return True, "Stealth applied."
+        self.stealth_applied = patched > 0
+        return self.stealth_applied, f"Stealth applied ({patched} target hook(s))."
+
+    def _patch_remote_export(self, module_name, function_name, patch, old_prot):
+        """Patch an export using the same module's local/remote RVA."""
+        local_mod = self.k32.GetModuleHandleA(module_name.encode("ascii"))
+        if not local_mod:
+            return 0
+        local_func = self.k32.GetProcAddress(local_mod, function_name.encode("ascii"))
+        remote_mod = self._remote_module_base(module_name)
+        if not local_func or not remote_mod:
+            return 0
+        remote_func = remote_mod + (local_func - local_mod)
+        size = len(patch)
+        if not self.k32.VirtualProtectEx(
+            self.process_info.hProcess, ctypes.c_void_p(remote_func), size,
+            PAGE_EXECUTE_READWRITE, ctypes.byref(old_prot)
+        ):
+            return 0
+        try:
+            written = bool(self.k32.WriteProcessMemory(
+                self.process_info.hProcess, ctypes.c_void_p(remote_func),
+                patch, size, None
+            ))
+            if not written:
+                return 0
+
+            # Never mark a hook as installed based only on the write result.
+            # Read the target bytes back and require an exact match.
+            verify = ctypes.create_string_buffer(size)
+            if not self.k32.ReadProcessMemory(
+                self.process_info.hProcess, ctypes.c_void_p(remote_func),
+                verify, size, None
+            ):
+                return 0
+            return int(verify.raw == bytes(patch))
+        finally:
+            self.k32.VirtualProtectEx(
+                self.process_info.hProcess, ctypes.c_void_p(remote_func), size,
+                old_prot.value, ctypes.byref(old_prot)
+            )
+
+    def _remote_module_base(self, module_name):
+        """Return a module base in the debuggee, or None on lookup failure."""
+        # PSAPI handles native 64-bit module enumeration without relying on
+        # a snapshot HANDLE whose size differs between Python architectures.
+        h_proc = self.process_info.hProcess
+        capacity = 1024
+        modules = (wintypes.HMODULE * capacity)()
+        needed = wintypes.DWORD()
+        if self.psapi.EnumProcessModulesEx(
+            h_proc, modules, ctypes.sizeof(modules), ctypes.byref(needed), 0x03
+        ):
+            count = min(needed.value // ctypes.sizeof(wintypes.HMODULE), capacity)
+            for index in range(count):
+                name_buf = ctypes.create_unicode_buffer(260)
+                self.psapi.GetModuleBaseNameW(
+                    h_proc, modules[index], name_buf, len(name_buf)
+                )
+                if name_buf.value.lower() == module_name.lower():
+                    return ctypes.cast(modules[index], ctypes.c_void_p).value
+
+        # Fallback for systems where PSAPI enumeration is restricted.
+        snap = self.k32.CreateToolhelp32Snapshot(0x00000008, self.process_info.dwProcessId)
+        if snap == ctypes.c_void_p(-1).value:
+            return None
+        class MODULEENTRY32W(ctypes.Structure):
+            _fields_ = [("dwSize", wintypes.DWORD), ("th32ModuleID", wintypes.DWORD),
+                        ("th32ProcessID", wintypes.DWORD), ("GlblcntUsage", wintypes.DWORD),
+                        ("ProccntUsage", wintypes.DWORD), ("modBaseAddr", ctypes.POINTER(ctypes.c_ubyte)),
+                        ("modBaseSize", wintypes.DWORD), ("hModule", wintypes.HMODULE),
+                        ("szModule", wintypes.WCHAR * 256), ("szExePath", wintypes.WCHAR * 260)]
+        entry = MODULEENTRY32W(); entry.dwSize = ctypes.sizeof(entry)
+        try:
+            ok = self.k32.Module32FirstW(snap, ctypes.byref(entry))
+            while ok:
+                if entry.szModule.lower() == module_name.lower():
+                    return ctypes.cast(entry.modBaseAddr, ctypes.c_void_p).value
+                ok = self.k32.Module32NextW(snap, ctypes.byref(entry))
+        finally:
+            self.k32.CloseHandle(snap)
+        return None
 
     def stop(self):
         self.is_running = False
+        self.step_mode = False
+        self.step_over_runtime = None
+        self.paused_thread_id = None
+        self.resume_event.set()
         if self.process_info:
-            self.k32.TerminateProcess(self.process_info.hProcess, 0)
+            process_handle = self.process_info.hProcess
+            thread_handle = self.process_info.hThread
+            self.k32.TerminateProcess(process_handle, 0)
+            self.k32.CloseHandle(process_handle)
+            self.k32.CloseHandle(thread_handle)
+            self.process_info = None
+            for handle in self.thread_handles.values():
+                if handle and handle != thread_handle:
+                    self.k32.CloseHandle(handle)
+            self.thread_handles.clear()
+            self.runtime_breakpoints.clear()
+            self.pending_reinsert = None
             self.signals.state_changed.emit("Debug process terminated.")
+
+    def resume(self):
+        self.step_mode = False
+        self.resume_event.set()
+
+    def step_into(self):
+        if not self.is_running or self.paused_thread_id is None:
+            self.signals.state_changed.emit("Step requires a paused debug event.")
+            return False
+        self.step_mode = True
+        self.resume_event.set()
+        return True
+
+    def step_over(self):
+        # GandonPRO tries the temporary-after-call breakpoint first. This is
+        # the fallback for non-call instructions.
+        return self.step_into()
+
+    def arm_step_over(self, runtime_address, static_address):
+        """Run over a call by stopping at the instruction after it."""
+        if not self.is_running or self.paused_thread_id is None:
+            self.signals.state_changed.emit("Step over requires a paused debug event.")
+            return False
+        if not self.process_info or runtime_address in self.runtime_breakpoints:
+            return False
+        thread_handle = self.thread_handles.get(self.paused_thread_id, self.process_info.hThread)
+        if self.pending_reinsert:
+            current_bp, current_original = self.pending_reinsert
+            self._write_byte(current_bp, 0xCC)
+            self.pending_reinsert = None
+            self._set_context_rip(thread_handle, current_bp, trap=False)
+        original = ctypes.c_ubyte()
+        if not self.k32.ReadProcessMemory(
+            self.process_info.hProcess, ctypes.c_void_p(runtime_address),
+            ctypes.byref(original), 1, None
+        ):
+            return False
+        if not self._write_byte(runtime_address, 0xCC):
+            return False
+        self._set_context_rip(thread_handle, runtime_address, trap=False)
+        self.step_over_runtime = (runtime_address, original.value, static_address)
+        self.step_mode = False
+        self.resume_event.set()
+        return True
+
+    def read_memory(self, address, size=128):
+        if not self.is_running or not self.process_info:
+            return b""
+        try:
+            size = max(1, min(int(size), 0x10000))
+            buffer = (ctypes.c_ubyte * size)()
+            read = ctypes.c_size_t(0)
+            ok = self.k32.ReadProcessMemory(
+                self.process_info.hProcess, ctypes.c_void_p(int(address)),
+                buffer, size, ctypes.byref(read)
+            )
+            return bytes(buffer[:read.value]) if ok else b""
+        except (TypeError, ValueError, OverflowError):
+            return b""
 
 
 # =====================================================================
@@ -292,6 +1073,7 @@ class Win32Debugger:
 class AboutDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
+        apply_windows_dark_titlebar(self)
         self.setWindowTitle("About Gandon-PRO")
         self.setFixedSize(600, 230)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint)
@@ -347,7 +1129,7 @@ class AboutDialog(QDialog):
         title_label.setWordWrap(True)
         info_layout.addWidget(title_label)
 
-        ver_label = QLabel("Version Beta 2.0 (PE/ELF + Win32 Debugger + Anti-Debug)")
+        ver_label = QLabel("Version Beta 2.1 (PE/ELF + Win32 Debugger + Anti-Debug)")
         ver_label.setFont(QFont("Segoe UI", 10))
         ver_label.setStyleSheet("color: #cccccc; border: none;")
         ver_label.setWordWrap(True)
@@ -388,6 +1170,10 @@ class AboutDialog(QDialog):
         main_layout.addWidget(card_widget)
         self.setStyleSheet("QDialog { background-color: #1e1e1e; }")
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        apply_windows_dark_titlebar(self)
+
 
 # =====================================================================
 #                         XREFS DIALOG (KEY X)
@@ -396,6 +1182,7 @@ class AboutDialog(QDialog):
 class XrefsDialog(QDialog):
     def __init__(self, target_name, xrefs, parent=None):
         super().__init__(parent)
+        apply_windows_dark_titlebar(self)
         self.setWindowTitle(f"xrefs to {target_name}")
         self.resize(640, 360)
         self.target_address = None
@@ -433,7 +1220,24 @@ class XrefsDialog(QDialog):
         layout.addLayout(btn_box)
 
         self.xrefs_data = xrefs
-        self.setStyleSheet("QDialog { background-color: #1e1e1e; }")
+        self.setStyleSheet("""
+            QDialog { background-color: #1e1e1e; color: #d4d4d4; }
+            QLabel { color: #d4d4d4; }
+            QTableWidget {
+                background-color: #252526; color: #d4d4d4;
+                gridline-color: #3c3c3c; border: 1px solid #3c3c3c;
+                selection-background-color: #264f78;
+            }
+            QHeaderView::section {
+                background-color: #2d2d2d; color: #9CDCFE;
+                border: 1px solid #3c3c3c; padding: 5px;
+            }
+            QPushButton {
+                background-color: #2d2d2d; color: #d4d4d4;
+                border: 1px solid #505050; padding: 5px 16px;
+            }
+            QPushButton:hover { background-color: #007acc; color: white; }
+        """)
 
     def on_select(self, item):
         row = item.row()
@@ -447,6 +1251,47 @@ class XrefsDialog(QDialog):
             self.accept()
 
 
+class CallGraphDialog(QDialog):
+    def __init__(self, call_graph, parent=None):
+        super().__init__(parent)
+        apply_windows_dark_titlebar(self)
+        self.setWindowTitle("Call Graph")
+        self.resize(760, 460)
+        theme = """
+            QDialog { background-color: #1e1e1e; color: #d4d4d4; }
+            QTableWidget {
+                background-color: #252526; color: #d4d4d4;
+                alternate-background-color: #2a2a2a;
+                gridline-color: #3c3c3c; border: 1px solid #3c3c3c;
+                selection-background-color: #264f78;
+            }
+            QHeaderView::section {
+                background-color: #2d2d2d; color: #9CDCFE;
+                border: 1px solid #3c3c3c; padding: 5px;
+            }
+            QTableCornerButton::section {
+                background-color: #2d2d2d; border: 1px solid #3c3c3c;
+            }
+        """
+        layout = QVBoxLayout(self)
+        table = QTableWidget()
+        table.setColumnCount(2)
+        table.setHorizontalHeaderLabels(["Caller", "Callee"])
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        table.setRowCount(sum(len(targets) for targets in call_graph.values()))
+        row = 0
+        for caller in sorted(call_graph):
+            for callee in sorted(call_graph[caller]):
+                table.setItem(row, 0, QTableWidgetItem(f"0x{caller:016X}"))
+                table.setItem(row, 1, QTableWidgetItem(f"0x{callee:016X}"))
+                row += 1
+        table.itemDoubleClicked.connect(
+            lambda item: self.parent().jump_to_address(int(table.item(item.row(), 1).text(), 16))
+        )
+        layout.addWidget(table)
+        self.setStyleSheet(theme)
+
+
 # =====================================================================
 #             SIGMAKER DIALOG (SIGNATURE GENERATOR)
 # =====================================================================
@@ -454,6 +1299,7 @@ class XrefsDialog(QDialog):
 class SigMakerDialog(QDialog):
     def __init__(self, sig_gandon, sig_cpp_mask, count_matches, parent=None):
         super().__init__(parent)
+        apply_windows_dark_titlebar(self)
         self.setWindowTitle("Signature Generator (SigMaker)")
         self.resize(600, 240)
         layout = QVBoxLayout(self)
@@ -640,7 +1486,7 @@ class BasicBlockItem(QGraphicsRectItem):
 
     def update_content(self, highlight_token=""):
         self.setBrush(QBrush(self.get_color()))
-        name = self.main_window.custom_names.get(self.addr, f"loc_{self.addr:08X}")
+        name = self.main_window.label_for(self.addr)
         user_comment = self.main_window.custom_comments.get(self.addr, "")
 
         html = f"<div style='font-family: Consolas; font-size: 11px; color: #d4d4d4;'>"
@@ -649,14 +1495,17 @@ class BasicBlockItem(QGraphicsRectItem):
             html += f"<span style='color: #6A9955;'> &nbsp;// {user_comment}</span>"
         html += "<hr style='border: 0.5px solid #3c3c3c; margin: 3px 0;'/>"
 
-        for mnem, op, comm in self.instructions:
+        instruction_addresses = self.main_window.block_instruction_addresses.get(self.addr, [])
+        for index, (mnem, op, comm) in enumerate(self.instructions):
             c_mnem = "#569CD6" if mnem.startswith("j") or mnem in ("call", "ret", "b", "bx", "bl") else "#9CDCFE"
             disp_op = op
             if highlight_token and highlight_token.lower() in op.lower():
                 pattern = re.compile(re.escape(highlight_token), re.IGNORECASE)
                 disp_op = pattern.sub(f"<span style='background-color:#515c6b; color:#FFE792;'>{highlight_token}</span>", op)
 
-            html += f"<div><span style='color:{c_mnem}; font-weight:bold;'>{mnem:<6}</span> "
+            is_current = index < len(instruction_addresses) and instruction_addresses[index] == self.main_window.current_instruction_va
+            row_style = "background-color:#264F78;" if is_current else ""
+            html += f"<div style='{row_style}'><span style='color:{c_mnem}; font-weight:bold;'>{mnem:<6}</span> "
             html += f"<span>{disp_op}</span>"
             if comm:
                 html += f" &nbsp;<span style='color:#6A9955;'>; {comm}</span>"
@@ -669,6 +1518,25 @@ class BasicBlockItem(QGraphicsRectItem):
         self.width = max(rect.width() + 22, 280)
         self.height = rect.height() + 8
         self.setRect(0, 0, self.width, self.height)
+        patched = False
+        if self.main_window.patch_history:
+            try:
+                base_offset = (self.addr - self.main_window.image_base) if self.main_window.is_elf else self.main_window.pe.get_offset_from_rva(self.addr - self.main_window.image_base)
+                # The block model stores display tuples rather than raw
+                # instruction objects; a conservative 16-byte/instruction
+                # span still gives a useful visual marker without altering
+                # the disassembly data model.
+                span = max(1, len(self.instructions) * 16)
+                patched = any(base_offset <= offset < base_offset + span for offset in self.main_window.patch_history)
+            except Exception:
+                patched = self.addr in self.main_window.patch_history
+        if self.addr in self.main_window.breakpoints:
+            border_color, border_width = "#F44747", 2.5
+        elif patched:
+            border_color, border_width = "#DCDCAA", 2.0
+        else:
+            border_color, border_width = "#454545", 1.5
+        self.setPen(QPen(QColor(border_color), border_width))
 
     def add_incoming_edge(self, edge):
         self.incoming_edges.append(edge)
@@ -680,9 +1548,12 @@ class BasicBlockItem(QGraphicsRectItem):
         menu = QMenu()
         act_decompile = menu.addAction("View Pseudocode (F5)")
         act_bp = menu.addAction("Toggle Breakpoint (F2)")
+        act_cond_bp = menu.addAction("Set Conditional Breakpoint...")
+        act_hw_bp = menu.addAction("Toggle Hardware Breakpoint")
         act_rename = menu.addAction("Rename Label (N)")
         act_comment = menu.addAction("Add Comment (;)")
         act_sig = menu.addAction("Generate SigMaker Pattern (Ctrl+B)")
+        act_edit = menu.addAction("Edit Instruction (Ctrl+E)")
         act_nop = menu.addAction("NOP Entire Block")
         col_menu = menu.addMenu("Set Color Tag")
         act_c_default = col_menu.addAction("Default Dark")
@@ -695,6 +1566,10 @@ class BasicBlockItem(QGraphicsRectItem):
             self.main_window.action_decompile_pseudocode()
         elif action == act_bp:
             self.main_window.toggle_breakpoint(self.addr)
+        elif action == act_cond_bp:
+            self.main_window.set_conditional_breakpoint_at(self.addr)
+        elif action == act_hw_bp:
+            self.main_window.toggle_hardware_breakpoint_at(self.addr)
         elif action == act_rename:
             self.main_window.action_rename_node()
         elif action == act_comment:
@@ -703,6 +1578,8 @@ class BasicBlockItem(QGraphicsRectItem):
             self.main_window.action_generate_signature()
         elif action == act_nop:
             self.main_window.action_patch_nop()
+        elif action == act_edit:
+            self.main_window.action_edit_instruction(self)
         elif action == act_c_default:
             self.main_window.custom_colors.pop(self.addr, None)
             self.update_content()
@@ -910,6 +1787,14 @@ class FlatDisasmWidget(QWidget):
             QPlainTextEdit {
                 background-color: #1e1e1e;
                 color: #d4d4d4;
+                border: 1px solid #3c3c3c;
+                selection-background-color: #264f78;
+            }
+        """)
+        self.editor.setStyleSheet("""
+            QPlainTextEdit {
+                background-color: #1e1e1e;
+                color: #d4d4d4;
                 border: none;
                 font-family: Consolas, monospace;
             }
@@ -919,7 +1804,7 @@ class FlatDisasmWidget(QWidget):
     def populate(self, blocks):
         lines = []
         for addr in sorted(blocks.keys()):
-            name = self.main_window.custom_names.get(addr, f"loc_{addr:08X}")
+            name = self.main_window.label_for(addr)
             comm = self.main_window.custom_comments.get(addr, "")
             lines.append(f"; ---------------------------------------------------------------------------")
             lines.append(f"{name}:" + (f"  ; {comm}" if comm else ""))
@@ -954,7 +1839,7 @@ class PseudocodeWidget(QWidget):
             self.editor.setPlainText("// No active function to decompile.")
             return
 
-        func_name = self.main_window.custom_names.get(start_va, f"sub_{start_va:08X}")
+        func_name = self.main_window.label_for(start_va, "sub")
         lines = []
         lines.append(f"// ==========================================================================")
         lines.append(f"// Decompiled by Gandon-PRO Pseudocode Engine")
@@ -963,7 +1848,9 @@ class PseudocodeWidget(QWidget):
         lines.append(f"__int64 __fastcall {func_name}(__int64 a1, __int64 a2, __int64 a3, __int64 a4)")
         lines.append("{")
         lines.append("    __int64 result = 0;")
-        lines.append("    __int64 v0, v1, v2, v3;\n")
+        lines.append("    __int64 v0, v1, v2, v3;")
+        lines.append("    // control-flow and stack effects are reconstructed from the available machine code")
+        lines.append("")
 
         cond_map = {
             "je": "==", "jz": "==", "jne": "!=", "jnz": "!=",
@@ -971,16 +1858,25 @@ class PseudocodeWidget(QWidget):
             "ja": ">", "jae": ">=", "jb": "<", "jbe": "<="
         }
         last_cmp = ("v0", "0", "==")
+        stack_depth = 0
 
         for addr in sorted(blocks.keys()):
-            b_name = self.main_window.custom_names.get(addr, f"loc_{addr:08X}")
+            b_name = self.main_window.label_for(addr)
             comm = self.main_window.custom_comments.get(addr, "")
             lines.append(f" {b_name}:" + (f" // {comm}" if comm else ""))
 
             for mnem, op, c in blocks[addr]:
                 parts = [p.strip() for p in op.split(",")] if op else []
 
-                if mnem in ("mov", "movsxd", "movzx"):
+                if mnem == "push":
+                    stack_depth += 1
+                    lines.append(f"    /* push {parts[0] if parts else 'value'} */")
+
+                elif mnem == "pop":
+                    stack_depth = max(0, stack_depth - 1)
+                    lines.append(f"    /* pop {parts[0] if parts else 'value'} */")
+
+                elif mnem in ("mov", "movsxd", "movzx", "movsx"):
                     if len(parts) == 2:
                         dst = parts[0].replace("dword ptr ", "").replace("qword ptr ", "")
                         src = parts[1]
@@ -1006,7 +1902,7 @@ class PseudocodeWidget(QWidget):
                     target = parts[0] if parts else "loc_???"
                     try:
                         t_val = int(target, 16)
-                        t_lbl = self.main_window.custom_names.get(t_val, f"loc_{t_val:08X}")
+                        t_lbl = self.main_window.label_for(t_val)
                     except ValueError:
                         t_lbl = target
                     lines.append(f"    if ({last_cmp[0]} {cond_op} {last_cmp[1]})")
@@ -1016,7 +1912,7 @@ class PseudocodeWidget(QWidget):
                     target = parts[0] if parts else "loc_???"
                     try:
                         t_val = int(target, 16)
-                        t_lbl = self.main_window.custom_names.get(t_val, f"loc_{t_val:08X}")
+                        t_lbl = self.main_window.label_for(t_val)
                     except ValueError:
                         t_lbl = target
                     lines.append(f"    goto {t_lbl};")
@@ -1027,7 +1923,19 @@ class PseudocodeWidget(QWidget):
                     lines.append(f"    result = ((__int64 (*)(...)){target})({call_label});")
 
                 elif mnem in ("ret", "bx lr"):
+                    if stack_depth:
+                        lines.append(f"    /* restore stack depth ({stack_depth}) */")
                     lines.append("    return result;")
+
+                elif mnem in ("nop", "int3"):
+                    lines.append(f"    /* {mnem} */")
+
+                else:
+                    # Preserve instructions that the small native backend
+                    # cannot safely translate instead of silently dropping
+                    # them from the decompiler output.
+                    rendered = f"{mnem} {op}".strip()
+                    lines.append(f"    /* {rendered} */" + (f" // {c}" if c else ""))
 
             lines.append("")
 
@@ -1040,8 +1948,22 @@ class HexViewWidget(QWidget):
     def __init__(self, main_window):
         super().__init__()
         self.main_window = main_window
+        self.raw_data = b""
+        self.image_base = 0
+        self.target_va = 0
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Address:"))
+        self.address_edit = QLineEdit()
+        self.address_edit.setPlaceholderText("0x140001000")
+        self.address_edit.returnPressed.connect(self.go_to_address)
+        controls.addWidget(self.address_edit, stretch=1)
+        go_button = QPushButton("Go")
+        go_button.clicked.connect(self.go_to_address)
+        controls.addWidget(go_button)
+        layout.addLayout(controls)
 
         self.editor = QPlainTextEdit()
         self.editor.setReadOnly(True)
@@ -1060,7 +1982,11 @@ class HexViewWidget(QWidget):
     def load_hex(self, raw_data, image_base, target_va, num_lines=512):
         if not raw_data:
             return
-        offset = max(0, target_va - image_base)
+        self.raw_data = raw_data
+        self.image_base = image_base
+        self.target_va = target_va
+        self.address_edit.setText(f"0x{target_va:X}")
+        offset = max(0, min(len(raw_data), target_va - image_base))
         data = raw_data[offset: offset + num_lines * 16]
         lines = []
         for idx in range(0, len(data), 16):
@@ -1071,6 +1997,16 @@ class HexViewWidget(QWidget):
             ascii_str = "".join([chr(b) if 0x20 <= b <= 0x7E else "." for b in chunk])
             lines.append(f"{curr_va:016X}  {p1}  {p2}  {ascii_str}")
         self.editor.setPlainText("\n".join(lines))
+
+    def go_to_address(self):
+        text = self.address_edit.text().strip()
+        try:
+            value = int(text, 16) if text.lower().startswith("0x") else int(text, 16)
+        except ValueError:
+            self.main_window.status_bar.showMessage("Invalid hex address.")
+            return
+        self.load_hex(self.raw_data, self.image_base, value)
+        self.main_window.status_bar.showMessage(f"Hex view: 0x{value:X}")
 
 
 class StringsWidget(QWidget):
@@ -1124,6 +2060,146 @@ class StringsWidget(QWidget):
         self.main_window.switch_to_gandon_view(int(addr_str, 16))
 
 
+class ResourcesWidget(QWidget):
+    def __init__(self, main_window):
+        super().__init__()
+        self.main_window = main_window
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["Resource", "Language", "RVA", "Size"])
+        self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.tree.setFont(QFont("Consolas", 9))
+        layout.addWidget(self.tree)
+
+    def load_resources(self, pe):
+        self.tree.clear()
+        if not pe or not hasattr(pe, "DIRECTORY_ENTRY_RESOURCE"):
+            return
+
+        def label(entry):
+            if entry.name is not None:
+                return str(entry.name)
+            return str(entry.id)
+
+        def walk(entries, parent):
+            for entry in entries:
+                item = QTreeWidgetItem([label(entry), "", "", ""])
+                parent.addChild(item)
+                if hasattr(entry, "directory"):
+                    walk(entry.directory.entries, item)
+                elif hasattr(entry, "data"):
+                    try:
+                        data = entry.data.struct
+                        item.setText(1, str(getattr(entry, "id", "")))
+                        item.setText(2, f"0x{data.OffsetToData:X}")
+                        item.setText(3, str(data.Size))
+                    except Exception:
+                        item.setText(3, "unavailable")
+
+        root = QTreeWidgetItem(["PE Resources", "", "", ""])
+        self.tree.addTopLevelItem(root)
+        walk(pe.DIRECTORY_ENTRY_RESOURCE.entries, root)
+        root.setExpanded(True)
+
+
+class SymbolsWidget(QWidget):
+    """Unified exports/imports and native debug-symbol metadata view."""
+    def __init__(self, main_window):
+        super().__init__()
+        self.main_window = main_window
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.info = QLabel("No symbols loaded.")
+        layout.addWidget(self.info)
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Source", "Name", "Address", "Details"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.table.setFont(QFont("Consolas", 9))
+        self.table.cellDoubleClicked.connect(self.jump_to_symbol)
+        layout.addWidget(self.table)
+
+    def clear(self):
+        self.table.setRowCount(0)
+        self.info.setText("No symbols loaded.")
+
+    def add(self, source, name, address="", details=""):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        for col, value in enumerate((source, name, address, details)):
+            self.table.setItem(row, col, QTableWidgetItem(str(value)))
+
+    def jump_to_symbol(self, row, _column):
+        item = self.table.item(row, 2)
+        if item and item.text().startswith("0x"):
+            try:
+                self.main_window.jump_to_address(int(item.text(), 16))
+            except ValueError:
+                pass
+
+    def load_pe(self, pe, image_base):
+        self.clear()
+        if not pe:
+            return
+        count = 0
+        if hasattr(pe, "DIRECTORY_ENTRY_EXPORT"):
+            for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
+                name = exp.name.decode(errors="ignore") if exp.name else f"ordinal_{exp.ordinal}"
+                self.add("PE export", name, f"0x{image_base + exp.address:X}", f"ordinal {exp.ordinal}")
+                count += 1
+        if hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
+            for entry in pe.DIRECTORY_ENTRY_IMPORT:
+                dll = entry.dll.decode(errors="ignore")
+                for imp in entry.imports:
+                    name = imp.name.decode(errors="ignore") if imp.name else f"ordinal_{imp.ordinal}"
+                    address = f"0x{imp.address:X}" if imp.address else ""
+                    self.add("PE import", name, address, dll)
+                    count += 1
+        pdb_paths = []
+        for debug in getattr(pe, "DIRECTORY_ENTRY_DEBUG", []):
+            entry = getattr(debug, "entry", debug)
+            raw_name = getattr(entry, "PdbFileName", b"")
+            if isinstance(raw_name, bytes):
+                raw_name = raw_name.split(b"\x00", 1)[0].decode(errors="ignore")
+            if raw_name:
+                pdb_paths.append(str(raw_name))
+        for pdb_path in dict.fromkeys(pdb_paths):
+            self.add("CodeView/PDB", os.path.basename(pdb_path), "", pdb_path)
+        note = f"{count} PE symbols"
+        if pdb_paths:
+            note += f" | PDB metadata: {len(pdb_paths)}"
+        self.info.setText(note + ". Double-click an address to jump.")
+
+    def load_elf(self, raw_data, image_base):
+        self.clear()
+        if not raw_data:
+            return
+        debug_sections = []
+        try:
+            from elftools.elf.elffile import ELFFile
+            import io
+            elf = ELFFile(io.BytesIO(bytes(raw_data)))
+            for section in elf.iter_sections():
+                name = section.name or ""
+                if name in (".symtab", ".dynsym"):
+                    for symbol in section.iter_symbols():
+                        if not symbol.name:
+                            continue
+                        address = int(symbol.entry["st_value"])
+                        self.add("ELF symbol", symbol.name, f"0x{address:X}", name)
+                elif name.startswith(".debug_"):
+                    debug_sections.append(name)
+            self.info.setText(
+                f"ELF symbols loaded; DWARF sections: {', '.join(debug_sections) or 'none'}."
+            )
+        except ImportError:
+            self.info.setText("ELF symbols require optional package: pyelftools.")
+        except Exception as exc:
+            self.info.setText(f"ELF symbol parsing error: {exc}")
+
+
 class LocalTypesWidget(QWidget):
     def __init__(self):
         super().__init__()
@@ -1143,10 +2219,47 @@ class LocalTypesWidget(QWidget):
         self.editor = QPlainTextEdit()
         self.editor.setReadOnly(True)
         self.editor.setFont(QFont("Consolas", 10))
+        self.editor.setStyleSheet("""
+            QPlainTextEdit {
+                background-color: #1e1e1e;
+                color: #d4d4d4;
+                border: 1px solid #3c3c3c;
+                selection-background-color: #264f78;
+            }
+        """)
         self.tree.itemClicked.connect(lambda it, c: self.editor.setPlainText(self.types_definitions.get(it.text(0), "")))
+        add_type = QPushButton("Add Type")
+        add_type.clicked.connect(self.add_type)
         splitter.addWidget(self.tree)
-        splitter.addWidget(self.editor)
+        editor_panel = QWidget()
+        editor_layout = QVBoxLayout(editor_panel)
+        editor_layout.setContentsMargins(0, 0, 0, 0)
+        editor_layout.addWidget(self.editor)
+        editor_layout.addWidget(add_type)
+        splitter.addWidget(editor_panel)
         layout.addWidget(splitter)
+
+    def add_type(self):
+        name, ok = QInputDialog.getText(self, "Add Type", "Type name:")
+        if not ok or not name.strip():
+            return
+        definition, ok = QInputDialog.getMultiLineText(
+            self, "Add Type", "C/C++ definition:", "struct Example {\n    int value;\n};"
+        )
+        if not ok or not definition.strip():
+            return
+        name = name.strip()
+        self.types_definitions[name] = definition.strip()
+        item = QTreeWidgetItem([name])
+        self.tree.addTopLevelItem(item)
+        self.tree.setCurrentItem(item)
+        self.editor.setPlainText(definition.strip())
+
+    def set_definitions(self, definitions):
+        self.types_definitions = dict(definitions)
+        self.tree.clear()
+        for name in self.types_definitions:
+            self.tree.addTopLevelItem(QTreeWidgetItem([name]))
 
 
 class ImportsWidget(QWidget):
@@ -1208,6 +2321,363 @@ class ExportsWidget(QWidget):
                 self.table.setItem(row, 2, QTableWidgetItem(name))
 
 
+class MemoryViewDialog(QDialog):
+    def __init__(self, main_window, address=0, parent=None):
+        super().__init__(parent or main_window)
+        self.main_window = main_window
+        apply_windows_dark_titlebar(self)
+        self.setWindowTitle("Memory View")
+        self.resize(760, 520)
+        self.setStyleSheet("""
+            QDialog { background-color: #1e1e1e; color: #d4d4d4; }
+            QLabel { color: #d4d4d4; }
+            QLineEdit {
+                background-color: #252526; color: #d4d4d4;
+                border: 1px solid #3c3c3c; padding: 5px;
+                selection-background-color: #264f78;
+            }
+            QPushButton {
+                background-color: #2d2d2d; color: #d4d4d4;
+                border: 1px solid #505050; padding: 5px 12px;
+            }
+            QPushButton:hover { background-color: #3e3e3e; }
+            QPlainTextEdit {
+                background-color: #1e1e1e; color: #4EC9B0;
+                border: 1px solid #3c3c3c;
+                font-family: Consolas, monospace;
+            }
+        """)
+        layout = QVBoxLayout(self)
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Address:"))
+        self.address_edit = QLineEdit(f"0x{address:X}" if address else "")
+        self.address_edit.setPlaceholderText("0x7FF...")
+        controls.addWidget(self.address_edit, stretch=1)
+        controls.addWidget(QLabel("Bytes:"))
+        self.size_edit = QLineEdit("256")
+        self.size_edit.setMaximumWidth(80)
+        controls.addWidget(self.size_edit)
+        refresh = QPushButton("Refresh")
+        refresh.clicked.connect(self.refresh)
+        controls.addWidget(refresh)
+        layout.addLayout(controls)
+
+        self.editor = QPlainTextEdit()
+        self.editor.setReadOnly(True)
+        self.editor.setFont(QFont("Consolas", 10))
+        layout.addWidget(self.editor)
+        if address:
+            self.refresh()
+
+    def refresh(self):
+        try:
+            text = self.address_edit.text().strip()
+            address = int(text, 16) if text.lower().startswith("0x") else int(text, 16)
+            size = max(1, min(int(self.size_edit.text()), 0x10000))
+        except ValueError:
+            self.editor.setPlainText("Invalid address or byte count.")
+            return
+        runtime_address = self.main_window.resolve_runtime_address(address)
+        data = self.main_window.dbg.read_memory(runtime_address, size)
+        if not data:
+            self.editor.setPlainText(
+                "No bytes read. Start the debuggee and pause it first.\n"
+                f"Requested: 0x{address:X} | Runtime: 0x{runtime_address:X}"
+            )
+            return
+        lines = []
+        for offset in range(0, len(data), 16):
+            chunk = data[offset:offset + 16]
+            hex_part = " ".join(f"{b:02X}" for b in chunk).ljust(47)
+            ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+            lines.append(f"{runtime_address + offset:016X}  {hex_part}  {ascii_part}")
+        self.editor.setPlainText("\n".join(lines))
+
+    def set_address(self, address):
+        if address:
+            self.address_edit.setText(f"0x{int(address):X}")
+
+
+class WatchDialog(QDialog):
+    def __init__(self, main_window, parent=None):
+        super().__init__(parent or main_window)
+        self.main_window = main_window
+        self.watches = []
+        apply_windows_dark_titlebar(self)
+        self.setWindowTitle("Watch / Locals")
+        self.resize(700, 520)
+        self.setStyleSheet("""
+            QDialog { background-color: #1e1e1e; color: #d4d4d4; }
+            QLabel { color: #d4d4d4; }
+            QLineEdit {
+                background-color: #252526; color: #d4d4d4;
+                border: 1px solid #3c3c3c; padding: 5px;
+                selection-background-color: #264f78;
+            }
+            QPushButton {
+                background-color: #2d2d2d; color: #d4d4d4;
+                border: 1px solid #505050; padding: 5px 12px;
+            }
+            QPushButton:hover { background-color: #3e3e3e; }
+            QTableWidget {
+                background-color: #1e1e1e; color: #d4d4d4;
+                gridline-color: #3c3c3c; border: 1px solid #3c3c3c;
+                selection-background-color: #264f78;
+            }
+            QHeaderView::section {
+                background-color: #2d2d2d; color: #9CDCFE;
+                border: 1px solid #3c3c3c; padding: 5px;
+            }
+        """)
+        layout = QVBoxLayout(self)
+
+        controls = QHBoxLayout()
+        self.address_edit = QLineEdit()
+        self.address_edit.setPlaceholderText("Address, e.g. 0x7FF000001000")
+        controls.addWidget(self.address_edit, stretch=1)
+        add = QPushButton("Add Watch")
+        add.clicked.connect(self.add_watch)
+        controls.addWidget(add)
+        refresh = QPushButton("Refresh")
+        refresh.clicked.connect(self.refresh)
+        controls.addWidget(refresh)
+        layout.addLayout(controls)
+
+        layout.addWidget(QLabel("Registers / Locals"))
+        self.reg_table = QTableWidget(0, 2)
+        self.reg_table.setHorizontalHeaderLabels(["Name", "Value"])
+        self.reg_table.verticalHeader().setVisible(False)
+        self.reg_table.horizontalHeader().setStretchLastSection(True)
+        self.reg_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.reg_table)
+
+        layout.addWidget(QLabel("Watched memory (8 bytes)"))
+        self.watch_table = QTableWidget(0, 3)
+        self.watch_table.setHorizontalHeaderLabels(["Address", "Value (hex)", "Status"])
+        self.watch_table.verticalHeader().setVisible(False)
+        self.watch_table.setColumnWidth(0, 190)
+        self.watch_table.setColumnWidth(2, 120)
+        self.watch_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.watch_table)
+
+    def add_watch(self):
+        text = self.address_edit.text().strip()
+        try:
+            address = int(text, 16) if text.lower().startswith("0x") else int(text, 16)
+        except ValueError:
+            return
+        if address not in self.watches:
+            self.watches.append(address)
+        self.address_edit.clear()
+        self.refresh()
+
+    def update_registers(self, registers):
+        self.reg_table.setRowCount(len(registers))
+        for row, (name, value) in enumerate(registers.items()):
+            self.reg_table.setItem(row, 0, QTableWidgetItem(name))
+            self.reg_table.setItem(row, 1, QTableWidgetItem(value))
+
+    def refresh(self):
+        self.watch_table.setRowCount(len(self.watches))
+        for row, address in enumerate(self.watches):
+            runtime_address = self.main_window.resolve_runtime_address(address)
+            data = self.main_window.dbg.read_memory(runtime_address, 8)
+            self.watch_table.setItem(row, 0, QTableWidgetItem(f"0x{address:016X}"))
+            self.watch_table.setItem(row, 1, QTableWidgetItem(data.hex(" ") if data else "—"))
+            self.watch_table.setItem(row, 2, QTableWidgetItem("OK" if data else "unavailable"))
+
+
+class ThreadStackDialog(QDialog):
+    def __init__(self, main_window, parent=None):
+        super().__init__(parent or main_window)
+        self.main_window = main_window
+        apply_windows_dark_titlebar(self)
+        self.setWindowTitle("Threads / Call Stack")
+        self.resize(760, 520)
+        self.setStyleSheet("""
+            QDialog { background-color: #1e1e1e; color: #d4d4d4; }
+            QLabel { color: #d4d4d4; }
+            QTableWidget {
+                background-color: #252526; color: #d4d4d4;
+                gridline-color: #3c3c3c; border: 1px solid #3c3c3c;
+                selection-background-color: #264f78;
+            }
+            QHeaderView::section {
+                background-color: #2d2d2d; color: #9CDCFE;
+                border: 1px solid #3c3c3c; padding: 5px;
+            }
+            QPushButton {
+                background-color: #2d2d2d; color: #d4d4d4;
+                border: 1px solid #505050; padding: 5px 12px;
+            }
+        """)
+        layout = QVBoxLayout(self)
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Threads"))
+        top.addStretch()
+        refresh = QPushButton("Refresh")
+        refresh.clicked.connect(self.refresh)
+        top.addWidget(refresh)
+        layout.addLayout(top)
+
+        self.threads = QTableWidget(0, 2)
+        self.threads.setHorizontalHeaderLabels(["Thread ID", "State"])
+        self.threads.verticalHeader().setVisible(False)
+        self.threads.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.threads)
+
+        layout.addWidget(QLabel("Current thread stack (raw 8-byte words)"))
+        self.stack = QTableWidget(0, 3)
+        self.stack.setHorizontalHeaderLabels(["Stack Address", "Value", "Symbol / Note"])
+        self.stack.verticalHeader().setVisible(False)
+        self.stack.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.stack)
+        layout.addWidget(QLabel("Call stack (frame-pointer unwind)"))
+        self.call_stack = QTableWidget(0, 3)
+        self.call_stack.setHorizontalHeaderLabels(["Frame", "Frame pointer", "Return address"])
+        self.call_stack.verticalHeader().setVisible(False)
+        self.call_stack.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.call_stack)
+        self.refresh()
+
+    def refresh(self):
+        rows = self.main_window.dbg.thread_rows()
+        self.threads.setRowCount(len(rows))
+        for row, (tid, state) in enumerate(rows):
+            self.threads.setItem(row, 0, QTableWidgetItem(str(tid)))
+            self.threads.setItem(row, 1, QTableWidgetItem(state))
+
+        stack_rows = self.main_window.dbg.stack_rows()
+        self.stack.setRowCount(len(stack_rows))
+        for row, (address, value) in enumerate(stack_rows):
+            self.stack.setItem(row, 0, QTableWidgetItem(f"0x{address:016X}"))
+            self.stack.setItem(row, 1, QTableWidgetItem(f"0x{value:016X}"))
+            label = self.main_window.label_for(value) if value in self.main_window.functions else ""
+            self.stack.setItem(row, 2, QTableWidgetItem(label))
+        frames = self.main_window.dbg.frame_rows()
+        self.call_stack.setRowCount(len(frames))
+        for row, (index, frame, ret) in enumerate(frames):
+            self.call_stack.setItem(row, 0, QTableWidgetItem(str(index)))
+            self.call_stack.setItem(row, 1, QTableWidgetItem(f"0x{frame:016X}"))
+            label = self.main_window.label_for(ret) if ret in self.main_window.functions else ""
+            text = f"0x{ret:016X}" + (f"  {label}" if label else "")
+            self.call_stack.setItem(row, 2, QTableWidgetItem(text))
+
+
+class BinaryDiffDialog(QDialog):
+    def __init__(self, main_window, parent=None):
+        super().__init__(parent or main_window)
+        self.main_window = main_window
+        apply_windows_dark_titlebar(self)
+        self.setWindowTitle("Binary Diff")
+        self.resize(820, 560)
+        layout = QVBoxLayout(self)
+        controls = QHBoxLayout()
+        self.path_edit = QLineEdit()
+        self.path_edit.setPlaceholderText("Select a second PE/ELF file")
+        controls.addWidget(self.path_edit, stretch=1)
+        browse = QPushButton("Browse")
+        browse.clicked.connect(self.browse)
+        controls.addWidget(browse)
+        compare = QPushButton("Compare")
+        compare.clicked.connect(self.compare)
+        controls.addWidget(compare)
+        layout.addLayout(controls)
+        self.summary = QLabel("No comparison performed.")
+        layout.addWidget(self.summary)
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["Offset", "Current", "Other"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table.verticalHeader().setVisible(False)
+        layout.addWidget(self.table)
+
+    def browse(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose binary", "", "All files (*)")
+        if path:
+            self.path_edit.setText(path)
+
+    def compare(self):
+        other_path = self.path_edit.text().strip()
+        if not other_path or not self.main_window.current_binary_path:
+            self.summary.setText("Load the current binary and choose another file first.")
+            return
+        try:
+            with open(self.main_window.current_binary_path, "rb") as handle:
+                current = handle.read()
+            with open(other_path, "rb") as handle:
+                other = handle.read()
+        except OSError as exc:
+            self.summary.setText(f"Read error: {exc}")
+            return
+        limit = min(len(current), len(other))
+        differences = [index for index in range(limit) if current[index] != other[index]]
+        differences.extend(range(limit, max(len(current), len(other))))
+        self.summary.setText(
+            f"Current: {len(current):,} bytes | Other: {len(other):,} bytes | "
+            f"Different offsets: {len(differences):,}"
+        )
+        self.table.setRowCount(min(len(differences), 5000))
+        for row, offset in enumerate(differences[:5000]):
+            left = f"{current[offset]:02X}" if offset < len(current) else "--"
+            right = f"{other[offset]:02X}" if offset < len(other) else "--"
+            self.table.setItem(row, 0, QTableWidgetItem(f"0x{offset:X}"))
+            self.table.setItem(row, 1, QTableWidgetItem(left))
+            self.table.setItem(row, 2, QTableWidgetItem(right))
+
+
+class PluginAPI:
+    def __init__(self, main_window):
+        self.main_window = main_window
+
+    def add_action(self, title, callback, menu="Plugins"):
+        target = self.main_window.plugin_menus.setdefault(menu, self.main_window.menuBar().addMenu(menu))
+        action = QAction(title, self.main_window)
+        action.triggered.connect(lambda _checked=False: callback(self))
+        target.addAction(action)
+        return action
+
+    def jump_to(self, address):
+        self.main_window.jump_to_address(int(address))
+
+    def read_file_bytes(self, offset, size):
+        return bytes(self.main_window.raw_data[int(offset):int(offset) + int(size)])
+
+    @property
+    def current_file(self):
+        return self.main_window.current_binary_path
+
+
+class PatternResultsDialog(QDialog):
+    def __init__(self, main_window, results, pattern, parent=None):
+        super().__init__(parent or main_window)
+        self.main_window = main_window
+        apply_windows_dark_titlebar(self)
+        self.setWindowTitle(f"Pattern Results ({len(results)})")
+        self.resize(620, 420)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(f"Matches for: {pattern}"))
+        self.table = QTableWidget(len(results), 3)
+        self.table.setHorizontalHeaderLabels(["#", "File offset", "Virtual address"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        for row, (offset, va) in enumerate(results):
+            self.table.setItem(row, 0, QTableWidgetItem(str(row + 1)))
+            self.table.setItem(row, 1, QTableWidgetItem(f"0x{offset:X}"))
+            self.table.setItem(row, 2, QTableWidgetItem(f"0x{va:X}"))
+        self.table.cellDoubleClicked.connect(self.jump_to_row)
+        layout.addWidget(self.table)
+        layout.addWidget(QLabel("Double-click a result to jump to it."))
+
+    def jump_to_row(self, row, _column):
+        item = self.table.item(row, 2)
+        if item:
+            self.main_window.jump_to_address(int(item.text(), 16))
+            self.accept()
+
+
 class DebuggerWidget(QWidget):
     def __init__(self, main_window):
         super().__init__()
@@ -1235,6 +2705,15 @@ class DebuggerWidget(QWidget):
         self.btn_run.setStyleSheet("background: #007acc; color: white; padding: 6px; font-weight: bold;")
         ctrl_layout.addWidget(self.btn_run)
 
+        step_row = QHBoxLayout()
+        self.btn_step_into = QPushButton("Step Into (F7)")
+        self.btn_step_into.clicked.connect(self.main_window.dbg_step_into)
+        step_row.addWidget(self.btn_step_into)
+        self.btn_step_over = QPushButton("Step Over (F8)")
+        self.btn_step_over.clicked.connect(self.main_window.dbg_step_over)
+        step_row.addWidget(self.btn_step_over)
+        ctrl_layout.addLayout(step_row)
+
         self.btn_antidebug = QPushButton("Apply Anti-Debug Bypass Now")
         self.btn_antidebug.clicked.connect(self.main_window.action_apply_antidebug)
         self.btn_antidebug.setStyleSheet("background: #388A34; color: white; padding: 6px;")
@@ -1249,6 +2728,13 @@ class DebuggerWidget(QWidget):
         self.bp_list = QTreeWidget()
         self.bp_list.setHeaderLabels(["Address", "Type"])
         ctrl_layout.addWidget(self.bp_list)
+        ctrl_layout.addWidget(QLabel("F2: toggle  |  Delete: remove selected"))
+        ctrl_layout.addWidget(QLabel("Debug event log:"))
+        self.event_log = QPlainTextEdit()
+        self.event_log.setReadOnly(True)
+        self.event_log.setMaximumHeight(135)
+        self.event_log.setFont(QFont("Consolas", 8))
+        ctrl_layout.addWidget(self.event_log)
 
         layout.addWidget(ctrl_panel, stretch=2)
 
@@ -1264,10 +2750,18 @@ class DebuggerWidget(QWidget):
             self.reg_table.setItem(row, 0, QTableWidgetItem(k))
             self.reg_table.setItem(row, 1, QTableWidgetItem(v))
 
+    def append_event(self, message):
+        self.event_log.appendPlainText(message)
+
 
 class GandonPRO(QMainWindow):
     def __init__(self):
         super().__init__()
+        apply_windows_dark_titlebar(self)
+        self._dark_message_filter = DarkMessageBoxFilter(self)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self._dark_message_filter)
         self.setWindowTitle("Gandon-PRO - The Interactive Disassembler & Debugger")
         self.resize(1400, 880)
 
@@ -1278,26 +2772,47 @@ class GandonPRO(QMainWindow):
         self.cs = None
         self.image_base = 0
         self.current_va = 0
+        self.current_instruction_va = 0
+        self.block_instruction_addresses = {}
         self.string_lookup = {}
         self.blocks = {}
         self.edges = []
         self.xrefs_db = {}
+        self.functions = set()
+        self.call_graph = {}
         self.history = []
         self.patch_history = {}
+        self.patch_undo_stack = []
+        self.patch_redo_stack = []
+        self.current_instruction_va = 0
+        self.debug_event_log = []
+        self.autosave_path = ""
         self.breakpoints = set()
+        self.bookmarks = {}
+        self.breakpoint_box = None
+        self.memory_dialog = None
+        self.watch_dialog = None
+        self.thread_stack_dialog = None
+        self.plugin_menus = {}
 
         self.dbg_signals = DebuggerSignals()
         self.dbg = Win32Debugger(self.dbg_signals)
         self.dbg_signals.registers_updated.connect(self.on_dbg_registers)
-        self.dbg_signals.state_changed.connect(lambda msg: self.status_bar.showMessage(msg))
+        self.dbg_signals.state_changed.connect(self.on_dbg_state)
         self.dbg_signals.breakpoint_hit.connect(self.on_dbg_bp_hit)
+        self.dbg_signals.step_finished.connect(self.on_dbg_step_finished)
 
         self.custom_names = {}
+        self.auto_names = {}
         self.custom_comments = {}
         self.custom_colors = {}
 
         self.init_ui()
         self.apply_dark_theme()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        apply_windows_dark_titlebar(self)
 
     def init_ui(self):
         menubar = self.menuBar()
@@ -1344,9 +2859,26 @@ class GandonPRO(QMainWindow):
         edit_menu.addAction(comment_act)
 
         patch_nop_act = QAction("NOP Current Block", self)
-        patch_nop_act.setShortcut(QKeySequence("F2"))
+        patch_nop_act.setShortcut(QKeySequence("Ctrl+F2"))
         patch_nop_act.triggered.connect(self.action_patch_nop)
         edit_menu.addAction(patch_nop_act)
+
+        edit_instruction_act = QAction("Edit Instruction", self)
+        edit_instruction_act.setShortcut(QKeySequence("Ctrl+E"))
+        # QAction.triggered sends a boolean checked argument.  Do not pass it
+        # as the optional `block` parameter of action_edit_instruction().
+        edit_instruction_act.triggered.connect(lambda _checked=False: self.action_edit_instruction())
+        edit_menu.addAction(edit_instruction_act)
+
+        undo_act = QAction("Undo Patch", self)
+        undo_act.setShortcut(QKeySequence("Ctrl+Z"))
+        undo_act.triggered.connect(self.undo_patch)
+        edit_menu.addAction(undo_act)
+
+        redo_act = QAction("Redo Patch", self)
+        redo_act.setShortcut(QKeySequence("Ctrl+Y"))
+        redo_act.triggered.connect(self.redo_patch)
+        edit_menu.addAction(redo_act)
 
         jump_menu = menubar.addMenu("Jump")
         jump_act = QAction("Jump to Address / Label", self)
@@ -1364,6 +2896,21 @@ class GandonPRO(QMainWindow):
         xrefs_act.triggered.connect(self.action_show_xrefs)
         jump_menu.addAction(xrefs_act)
 
+        bookmark_act = QAction("Toggle Bookmark", self)
+        bookmark_act.setShortcut(QKeySequence("Ctrl+Shift+B"))
+        bookmark_act.triggered.connect(lambda _checked=False: self.toggle_bookmark())
+        jump_menu.addAction(bookmark_act)
+
+        next_bookmark_act = QAction("Next Bookmark", self)
+        next_bookmark_act.setShortcut(QKeySequence("F6"))
+        next_bookmark_act.triggered.connect(lambda _checked=False: self.next_bookmark())
+        jump_menu.addAction(next_bookmark_act)
+
+        find_function_act = QAction("Find Function...", self)
+        find_function_act.setShortcut(QKeySequence("Ctrl+G"))
+        find_function_act.triggered.connect(self.action_find_function)
+        jump_menu.addAction(find_function_act)
+
         tools_menu = menubar.addMenu("Tools")
         decompile_act = QAction("Decompile to Pseudocode", self)
         decompile_act.setShortcut(QKeySequence("F5"))
@@ -1380,15 +2927,83 @@ class GandonPRO(QMainWindow):
         search_sig_act.triggered.connect(self.action_search_pattern)
         tools_menu.addAction(search_sig_act)
 
+        call_graph_act = QAction("Call Graph", self)
+        call_graph_act.triggered.connect(self.action_show_call_graph)
+        tools_menu.addAction(call_graph_act)
+
+        memory_act = QAction("Memory View", self)
+        memory_act.triggered.connect(self.show_memory_view)
+        tools_menu.addAction(memory_act)
+
+        watch_act = QAction("Watch / Locals", self)
+        watch_act.triggered.connect(self.show_watch_view)
+        tools_menu.addAction(watch_act)
+
+        thread_stack_act = QAction("Threads / Call Stack", self)
+        thread_stack_act.triggered.connect(self.show_thread_stack)
+        tools_menu.addAction(thread_stack_act)
+
+        diff_act = QAction("Compare Binary...", self)
+        diff_act.triggered.connect(self.show_binary_diff)
+        tools_menu.addAction(diff_act)
+
+        plugin_act = QAction("Load Python Plugin...", self)
+        plugin_act.triggered.connect(self.load_plugin)
+        tools_menu.addAction(plugin_act)
+
+        export_log_act = QAction("Export Debug Event Log...", self)
+        export_log_act.triggered.connect(self.export_debug_event_log)
+        tools_menu.addAction(export_log_act)
+
+        search_all_act = QAction("Search Text / Address...", self)
+        search_all_act.setShortcut(QKeySequence("Ctrl+F"))
+        search_all_act.triggered.connect(self.action_search_text)
+        tools_menu.addAction(search_all_act)
+
+        export_analysis_act = QAction("Export Analysis JSON...", self)
+        export_analysis_act.triggered.connect(self.export_analysis_json)
+        tools_menu.addAction(export_analysis_act)
+
+        export_bp_act = QAction("Export Breakpoints CSV...", self)
+        export_bp_act.triggered.connect(self.export_breakpoints_csv)
+        tools_menu.addAction(export_bp_act)
+
         dbg_menu = menubar.addMenu("Debugger")
         dbg_run_act = QAction("Start / Continue Process", self)
         dbg_run_act.setShortcut(QKeySequence("F9"))
-        dbg_run_act.triggered.connect(self.dbg_continue)
+        dbg_run_act.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        dbg_run_act.triggered.connect(lambda _checked=False: self.dbg_continue())
         dbg_menu.addAction(dbg_run_act)
 
+        dbg_step_into_act = QAction("Step Into", self)
+        dbg_step_into_act.setShortcut(QKeySequence("F7"))
+        dbg_step_into_act.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        dbg_step_into_act.triggered.connect(lambda _checked=False: self.dbg_step_into())
+        dbg_menu.addAction(dbg_step_into_act)
+
+        dbg_step_over_act = QAction("Step Over", self)
+        dbg_step_over_act.setShortcut(QKeySequence("F8"))
+        dbg_step_over_act.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        dbg_step_over_act.triggered.connect(lambda _checked=False: self.dbg_step_over())
+        dbg_menu.addAction(dbg_step_over_act)
+
         dbg_bp_act = QAction("Toggle Breakpoint", self)
-        dbg_bp_act.triggered.connect(lambda: self.toggle_breakpoint(self.current_va))
+        dbg_bp_act.setShortcut(QKeySequence("F2"))
+        dbg_bp_act.triggered.connect(lambda: self.toggle_breakpoint(self._selected_breakpoint_address()))
         dbg_menu.addAction(dbg_bp_act)
+
+        dbg_cond_bp_act = QAction("Set Conditional Breakpoint...", self)
+        dbg_cond_bp_act.triggered.connect(self.set_conditional_breakpoint)
+        dbg_menu.addAction(dbg_cond_bp_act)
+
+        dbg_hw_bp_act = QAction("Toggle Hardware Breakpoint", self)
+        dbg_hw_bp_act.triggered.connect(self.toggle_hardware_breakpoint)
+        dbg_menu.addAction(dbg_hw_bp_act)
+
+        dbg_del_bp_act = QAction("Delete Selected Breakpoint", self)
+        dbg_del_bp_act.setShortcut(QKeySequence("Delete"))
+        dbg_del_bp_act.triggered.connect(self.remove_selected_breakpoint)
+        dbg_menu.addAction(dbg_del_bp_act)
 
         self.act_stealth_toggle = QAction("Auto-Stealth on Startup", self, checkable=True)
         self.act_stealth_toggle.setChecked(True)
@@ -1408,6 +3023,11 @@ class GandonPRO(QMainWindow):
         toggle_view_act.setShortcut(QKeySequence(Qt.Key.Key_Space))
         toggle_view_act.triggered.connect(self.toggle_graph_flat_view)
         view_menu.addAction(toggle_view_act)
+
+        fit_graph_act = QAction("Fit Graph", self)
+        fit_graph_act.setShortcut(QKeySequence("Home"))
+        fit_graph_act.triggered.connect(self.fit_graph)
+        view_menu.addAction(fit_graph_act)
 
         view_menu.addSeparator()
         act_gandon = QAction("Gandon View-A (Graph)", self)
@@ -1446,6 +3066,14 @@ class GandonPRO(QMainWindow):
         act_strings.setShortcut(QKeySequence("Shift+F12"))
         act_strings.triggered.connect(lambda: self.tab_widget.setCurrentIndex(8))
         view_menu.addAction(act_strings)
+
+        act_resources = QAction("Resources", self)
+        act_resources.triggered.connect(lambda: self.tab_widget.setCurrentIndex(9))
+        view_menu.addAction(act_resources)
+
+        act_symbols = QAction("Symbols / Debug Info", self)
+        act_symbols.triggered.connect(lambda: self.tab_widget.setCurrentIndex(10))
+        view_menu.addAction(act_symbols)
 
         help_menu = menubar.addMenu("Help")
         about_act = QAction("About Gandon-PRO...", self)
@@ -1490,6 +3118,10 @@ class GandonPRO(QMainWindow):
         self.tab_widget.addTab(self.exports_view, "Exports")
         self.strings_view = StringsWidget(self)
         self.tab_widget.addTab(self.strings_view, "Strings")
+        self.resources_view = ResourcesWidget(self)
+        self.tab_widget.addTab(self.resources_view, "Resources")
+        self.symbols_view = SymbolsWidget(self)
+        self.tab_widget.addTab(self.symbols_view, "Symbols / Debug Info")
 
         self.main_splitter.addWidget(self.tab_widget)
         self.main_splitter.setStretchFactor(0, 0)
@@ -1499,7 +3131,7 @@ class GandonPRO(QMainWindow):
         self.setCentralWidget(self.main_splitter)
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("Ready. Shortcuts: F5 (Pseudocode), F9 (Debug Run), X (XREFs), Ctrl+B (SigMaker), Space (Switch)")
+        self.status_bar.showMessage("Ready. Shortcuts: F5 Pseudocode, F7 Step Into, F8 Step Over, F9 Continue, X XREFs, Ctrl+B SigMaker, Space Switch")
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1509,7 +3141,7 @@ class GandonPRO(QMainWindow):
             self.overview.move(max(10, w - 200), max(10, h - 160))
 
     def apply_dark_theme(self):
-        self.setStyleSheet("""
+        theme = """
             QMainWindow { background-color: #1e1e1e; }
             QMenuBar { background-color: #2d2d2d; color: #cccccc; }
             QMenuBar::item:selected { background-color: #3e3e3e; }
@@ -1546,7 +3178,19 @@ class GandonPRO(QMainWindow):
             QScrollBar:vertical, QScrollBar:horizontal { background: #1e1e1e; border: none; }
             QScrollBar::handle:vertical, QScrollBar::handle:horizontal { background: #3e3e3e; min-height: 20px; min-width: 20px; }
             QStatusBar { background-color: #007acc; color: #ffffff; }
-        """)
+            QMessageBox { background-color: #1e1e1e; color: #d4d4d4; }
+            QMessageBox QLabel { color: #d4d4d4; }
+            QMessageBox QPushButton {
+                background-color: #2d2d2d; color: #d4d4d4;
+                border: 1px solid #505050; padding: 5px 18px;
+                min-width: 70px;
+            }
+            QMessageBox QPushButton:hover { background-color: #3e3e3e; }
+        """
+        self.setStyleSheet(theme)
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(theme)
 
     def show_about_dialog(self):
         dialog = AboutDialog(self)
@@ -1590,6 +3234,27 @@ class GandonPRO(QMainWindow):
                     return
             self.jump_to_address(target_va)
 
+    def action_find_function(self):
+        if not self.functions:
+            QMessageBox.information(self, "Find Function", "No functions have been discovered yet.")
+            return
+        values = [f"{self.label_for(addr, 'sub')}  (0x{addr:X})" for addr in sorted(self.functions)]
+        choice, ok = QInputDialog.getItem(self, "Find Function", "Function:", values, 0, False)
+        if ok and choice:
+            try:
+                address = int(choice.rsplit("0x", 1)[1].rstrip(")"), 16)
+                self.jump_to_address(address)
+            except (IndexError, ValueError):
+                pass
+
+    def fit_graph(self):
+        if not self.graph_view.scene.items():
+            return
+        rect = self.graph_view.scene.itemsBoundingRect()
+        if rect.isValid() and rect.width() > 0 and rect.height() > 0:
+            self.graph_view.fitInView(rect.adjusted(-30, -30, 30, 30), Qt.AspectRatioMode.KeepAspectRatio)
+            self.overview.update_viewport()
+
     def jump_to_address(self, addr):
         if self.current_va:
             self.history.append(self.current_va)
@@ -1599,8 +3264,15 @@ class GandonPRO(QMainWindow):
             node = self.graph_view.nodes[addr]
             self.graph_view.centerOn(node)
             node.setSelected(True)
+            for graph_node in self.graph_view.nodes.values():
+                graph_node.update_content()
         else:
             self.build_cfg_graph(addr)
+
+    def set_current_instruction(self, addr):
+        self.current_instruction_va = int(addr or 0)
+        for node in self.graph_view.nodes.values():
+            node.update_content()
 
     def action_jump_back(self):
         if self.history:
@@ -1610,6 +3282,34 @@ class GandonPRO(QMainWindow):
                 self.graph_view.centerOn(self.graph_view.nodes[prev_va])
             else:
                 self.build_cfg_graph(prev_va)
+
+    def toggle_bookmark(self):
+        address = self.current_va
+        if not address:
+            self.status_bar.showMessage("Select an address before adding a bookmark.")
+            return
+        if address in self.bookmarks:
+            del self.bookmarks[address]
+            self.status_bar.showMessage(f"Bookmark removed: 0x{address:X}")
+            return
+        name, ok = QInputDialog.getText(
+            self, "Add Bookmark", "Label:",
+            text=self.label_for(address)
+        )
+        if ok:
+            self.bookmarks[address] = name.strip() or self.label_for(address)
+            self.status_bar.showMessage(f"Bookmark added: 0x{address:X}")
+
+    def next_bookmark(self):
+        if not self.bookmarks:
+            self.status_bar.showMessage("No bookmarks saved.")
+            return
+        addresses = sorted(self.bookmarks)
+        next_address = next((value for value in addresses if value > self.current_va), addresses[0])
+        self.jump_to_address(next_address)
+        self.status_bar.showMessage(
+            f"Bookmark: {self.bookmarks[next_address]} (0x{next_address:X})"
+        )
 
     def action_show_xrefs(self):
         target_addr = None
@@ -1663,15 +3363,101 @@ class GandonPRO(QMainWindow):
             QMessageBox.information(self, "XREFs", f"No cross-references found for 0x{target_addr:08X}.")
             return
 
-        name = self.custom_names.get(target_addr, f"loc_{target_addr:08X}")
+        name = self.label_for(target_addr)
         dlg = XrefsDialog(name, unique_xrefs, self)
         if dlg.exec() and dlg.target_address:
             self.jump_to_address(dlg.target_address)
 
+    def action_show_call_graph(self):
+        if not self.call_graph:
+            QMessageBox.information(self, "Call Graph", "No direct calls discovered yet.")
+            return
+        CallGraphDialog(self.call_graph, self).exec()
+
+    def show_memory_view(self):
+        address = self.current_va or self.image_base
+        if self.memory_dialog is None:
+            self.memory_dialog = MemoryViewDialog(self, address, self)
+        else:
+            self.memory_dialog.set_address(address)
+            self.memory_dialog.refresh()
+        self.memory_dialog.show()
+        self.memory_dialog.raise_()
+        self.memory_dialog.activateWindow()
+
+    def show_watch_view(self):
+        if self.watch_dialog is None:
+            self.watch_dialog = WatchDialog(self, self)
+        else:
+            self.watch_dialog.refresh()
+        self.watch_dialog.show()
+        self.watch_dialog.raise_()
+        self.watch_dialog.activateWindow()
+
+    def show_thread_stack(self):
+        if self.thread_stack_dialog is None:
+            self.thread_stack_dialog = ThreadStackDialog(self, self)
+        else:
+            self.thread_stack_dialog.refresh()
+        self.thread_stack_dialog.show()
+        self.thread_stack_dialog.raise_()
+        self.thread_stack_dialog.activateWindow()
+
+    def show_binary_diff(self):
+        dialog = BinaryDiffDialog(self, self)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def load_plugin(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Python Plugin", "", "Python files (*.py)"
+        )
+        if not path:
+            return
+        try:
+            name = f"gandon_plugin_{len(self.plugin_menus)}_{os.path.basename(path).replace('.', '_')}"
+            spec = importlib.util.spec_from_file_location(name, path)
+            if spec is None or spec.loader is None:
+                raise RuntimeError("Could not create a plugin loader")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            register = getattr(module, "register", None)
+            if not callable(register):
+                raise RuntimeError("Plugin must expose register(api)")
+            register(PluginAPI(self))
+            self.status_bar.showMessage(f"Plugin loaded: {os.path.basename(path)}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Plugin Error", str(exc))
+
+    def dbg_step_into(self):
+        if self.dbg.step_into():
+            self.status_bar.showMessage("Single-step armed. F7/F8 will stop after one instruction.")
+
+    def dbg_step_over(self):
+        # Prefer a temporary breakpoint after a direct call. Other
+        # instructions use the debugger's one-instruction trap.
+        if self.dbg.paused_thread_id and self.current_va and self.raw_data and self.cs:
+            try:
+                offset = (self.current_va - self.image_base) if self.is_elf else self.pe.get_offset_from_rva(self.current_va - self.image_base)
+                insn = next(iter(self.cs.disasm(bytes(self.raw_data[offset:offset + 16]), self.current_va)), None)
+                if insn and insn.mnemonic.lower() in ("call", "bl", "blr"):
+                    next_va = insn.address + insn.size
+                    runtime = self.resolve_runtime_address(next_va)
+                    if self.dbg.arm_step_over(runtime, next_va):
+                        self.status_bar.showMessage(
+                            f"Step over armed: stop at 0x{next_va:X}."
+                        )
+                        return
+            except (ValueError, TypeError, StopIteration):
+                pass
+        if self.dbg.step_over():
+            self.status_bar.showMessage("Step-over command armed.")
+
     def action_rename_node(self):
         for item in self.graph_view.scene.selectedItems():
             if isinstance(item, BasicBlockItem):
-                old_name = self.custom_names.get(item.addr, f"loc_{item.addr:08X}")
+                old_name = self.label_for(item.addr)
                 new_name, ok = QInputDialog.getText(self, "Rename Label", "New Label Name:", text=old_name)
                 if ok and new_name:
                     self.custom_names[item.addr] = new_name.strip()
@@ -1690,16 +3476,98 @@ class GandonPRO(QMainWindow):
                     self.flat_view.populate(self.blocks)
                 return
 
+    def action_edit_instruction(self, block=None):
+        """Assemble and replace one instruction in the selected block."""
+        if Ks is None:
+            QMessageBox.warning(
+                self, "Assembler unavailable",
+                "Install Keystone first:\n\npy -m pip install keystone-engine"
+            )
+            return
+        if self.is_elf or not self.pe or not self.raw_data:
+            QMessageBox.information(
+                self, "Inline assembler", "Inline editing currently supports PE x86/x64 files."
+            )
+            return
+
+        if block is None:
+            selected = [x for x in self.graph_view.scene.selectedItems()
+                        if isinstance(x, BasicBlockItem)]
+            if not selected:
+                QMessageBox.information(self, "Inline assembler", "Select a basic block first.")
+                return
+            block = selected[0]
+
+        offset = self.pe.get_offset_from_rva(block.addr - self.image_base)
+        raw = bytes(self.raw_data[offset:offset + 2048])
+        instructions = list(self.cs.disasm(raw, block.addr))
+        if not instructions:
+            QMessageBox.warning(self, "Inline assembler", "Could not decode this block.")
+            return
+
+        labels = [f"0x{i.address:016X}: {i.mnemonic} {i.op_str}".strip()
+                  for i in instructions]
+        chosen, ok = QInputDialog.getItem(
+            self, "Edit instruction", "Instruction:", labels, 0, False
+        )
+        if not ok:
+            return
+        index = labels.index(chosen)
+        old_insn = instructions[index]
+        new_text, ok = QInputDialog.getText(
+            self, "Edit instruction",
+            f"Assembly at 0x{old_insn.address:X}:",
+            text=f"{old_insn.mnemonic} {old_insn.op_str}".strip()
+        )
+        if not ok or not new_text.strip():
+            return
+
+        mode = KS_MODE_64 if self.cs.mode & CS_MODE_64 else KS_MODE_32
+        try:
+            assembler = Ks(KS_ARCH_X86, mode)
+            encoded, _ = assembler.asm(new_text.strip(), old_insn.address)
+            new_bytes = bytes(encoded)
+        except Exception as exc:
+            QMessageBox.warning(self, "Assembly error", str(exc))
+            return
+
+        if len(new_bytes) > old_insn.size:
+            QMessageBox.warning(
+                self, "Instruction too large",
+                f"New instruction is {len(new_bytes)} bytes; available space is {old_insn.size}."
+            )
+            return
+
+        file_offset = offset + (old_insn.address - block.addr)
+        replacement = new_bytes + b"\x90" * (old_insn.size - len(new_bytes))
+        changes = []
+        for index, value in enumerate(replacement):
+            position = file_offset + index
+            old_value = self.raw_data[position]
+            self.raw_data[position] = value
+            self.patch_history[position] = (old_value, value)
+            changes.append((position, old_value, value))
+        self._record_patch(changes)
+
+        self.pe.__data__ = bytes(self.raw_data)
+        self.status_bar.showMessage(
+            f"Patched 0x{old_insn.address:X}: {new_text.strip()} | Ctrl+Alt+P to save."
+        )
+        self.build_cfg_graph(self.current_va)
+
     def action_patch_nop(self):
         for item in self.graph_view.scene.selectedItems():
             if isinstance(item, BasicBlockItem):
                 try:
                     offset = (item.addr - self.image_base) if self.is_elf else self.pe.get_offset_from_rva(item.addr - self.image_base)
+                    changes = []
                     for i in range(min(15, len(item.instructions) * 3)):
                         if offset + i < len(self.raw_data):
                             old = self.raw_data[offset + i]
                             self.raw_data[offset + i] = 0x90
                             self.patch_history[offset + i] = (old, 0x90)
+                            changes.append((offset + i, old, 0x90))
+                    self._record_patch(changes)
                     if self.pe:
                         self.pe.__data__ = bytes(self.raw_data)
                     self.status_bar.showMessage(f"Patched block 0x{item.addr:08X} with NOPs. Ctrl+Alt+P to save.")
@@ -1707,6 +3575,51 @@ class GandonPRO(QMainWindow):
                 except Exception as e:
                     QMessageBox.warning(self, "Patch Error", str(e))
                 return
+
+    def _record_patch(self, changes):
+        changes = [tuple(change) for change in changes if change[1] != change[2]]
+        if changes:
+            self.patch_undo_stack.append(changes)
+            self.patch_redo_stack.clear()
+
+    def _refresh_after_patch(self):
+        if self.pe:
+            self.pe.__data__ = bytes(self.raw_data)
+        for node in self.graph_view.nodes.values():
+            node.update_content()
+        self.flat_view.populate(self.blocks)
+        if self.current_va:
+            self.build_cfg_graph(self.current_va)
+        self.status_bar.showMessage("Patch state updated.")
+
+    def undo_patch(self):
+        if not self.patch_undo_stack:
+            self.status_bar.showMessage("Nothing to undo.")
+            return
+        changes = self.patch_undo_stack.pop()
+        for position, old, new in changes:
+            self.raw_data[position] = old
+            if position in self.patch_history:
+                original, _current = self.patch_history[position]
+                if old == original:
+                    self.patch_history.pop(position, None)
+                else:
+                    self.patch_history[position] = (original, old)
+        self.patch_redo_stack.append(changes)
+        self._refresh_after_patch()
+        self.status_bar.showMessage("Patch undone. Ctrl+Y to redo.")
+
+    def redo_patch(self):
+        if not self.patch_redo_stack:
+            self.status_bar.showMessage("Nothing to redo.")
+            return
+        changes = self.patch_redo_stack.pop()
+        for position, old, new in changes:
+            self.raw_data[position] = new
+            self.patch_history[position] = (old, new)
+        self.patch_undo_stack.append(changes)
+        self._refresh_after_patch()
+        self.status_bar.showMessage("Patch redone. Ctrl+Z to undo.")
 
     def action_export_patched_file(self):
         if not self.patch_history:
@@ -1826,18 +3739,25 @@ class GandonPRO(QMainWindow):
 
         try:
             reg = re.compile(b"".join(regex_parts), re.DOTALL)
-            match = reg.search(self.raw_data)
-            if match:
+            matches = list(reg.finditer(self.raw_data))
+            if not matches:
+                QMessageBox.information(self, "Pattern Search", "Pattern not found.")
+                return
+            results = []
+            for match in matches:
                 found_offset = match.start()
                 if self.is_elf:
                     target_va = self.image_base + found_offset
                 else:
                     found_rva = self.pe.get_rva_from_offset(found_offset)
                     target_va = self.image_base + found_rva
-                self.jump_to_address(target_va)
-                self.status_bar.showMessage(f"Pattern found at 0x{target_va:08X}")
+                results.append((found_offset, target_va))
+            self.jump_to_address(results[0][1])
+            if len(results) == 1:
+                self.status_bar.showMessage(f"Pattern found at 0x{results[0][1]:08X}")
             else:
-                QMessageBox.information(self, "Pattern Search", "Pattern not found.")
+                self.status_bar.showMessage(f"Pattern matches: {len(results)}")
+                PatternResultsDialog(self, results, sig.strip(), self).exec()
         except Exception as e:
             QMessageBox.warning(self, "Search Error", str(e))
 
@@ -1860,14 +3780,34 @@ class GandonPRO(QMainWindow):
     def save_database(self):
         file_path, _ = QFileDialog.getSaveFileName(self, "Save Project DB", "project.gnd", "Gandon DB (*.gnd)")
         if file_path:
-            db_data = {
-                "custom_names": {str(k): v for k, v in self.custom_names.items()},
-                "custom_comments": {str(k): v for k, v in self.custom_comments.items()},
-                "custom_colors": {str(k): v for k, v in self.custom_colors.items()}
-            }
+            db_data = self.project_payload()
             with open(file_path, "w", encoding="utf-8") as f:
                 json.dump(db_data, f, indent=4)
             self.status_bar.showMessage("Project database saved successfully.")
+
+    def project_payload(self):
+        return {
+                "custom_names": {str(k): v for k, v in self.custom_names.items()},
+                "auto_names": {str(k): v for k, v in self.auto_names.items()},
+                "custom_comments": {str(k): v for k, v in self.custom_comments.items()},
+                "custom_colors": {str(k): v for k, v in self.custom_colors.items()},
+                "breakpoints": [f"0x{value:X}" for value in sorted(self.breakpoints)],
+                "breakpoint_conditions": {str(k): v for k, v in self.dbg.breakpoint_conditions.items()},
+                "hardware_breakpoints": [f"0x{value:X}" for value, _base in sorted(self.dbg.requested_hardware_breakpoints)],
+                "bookmarks": {str(k): v for k, v in self.bookmarks.items()},
+                "types": self.local_types_view.types_definitions
+            }
+
+    def autosave_project(self):
+        if not self.current_binary_path:
+            return
+        try:
+            self.autosave_path = self.current_binary_path + ".gnd"
+            with open(self.autosave_path, "w", encoding="utf-8") as handle:
+                json.dump(self.project_payload(), handle, indent=2)
+            self.debug_event_log.append(f"Project autosaved: {self.autosave_path}")
+        except OSError as exc:
+            self.debug_event_log.append(f"Project autosave failed: {exc}")
 
     def load_database(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Load Project DB", "", "Gandon DB (*.gnd)")
@@ -1875,8 +3815,29 @@ class GandonPRO(QMainWindow):
             with open(file_path, "r", encoding="utf-8") as f:
                 db_data = json.load(f)
                 self.custom_names = {int(k): v for k, v in db_data.get("custom_names", {}).items()}
+                self.auto_names.update({int(k): v for k, v in db_data.get("auto_names", {}).items()})
                 self.custom_comments = {int(k): v for k, v in db_data.get("custom_comments", {}).items()}
                 self.custom_colors = {int(k): v for k, v in db_data.get("custom_colors", {}).items()}
+                self.breakpoints = {
+                    int(value, 16) if isinstance(value, str) else int(value)
+                    for value in db_data.get("breakpoints", [])
+                }
+                self.dbg.requested_breakpoints = {
+                    (value, self.image_base) for value in self.breakpoints
+                }
+                self.dbg.breakpoint_conditions = {
+                    int(k): str(v) for k, v in db_data.get("breakpoint_conditions", {}).items()
+                }
+                self.dbg.requested_hardware_breakpoints = {
+                    (int(value, 16) if isinstance(value, str) else int(value), self.image_base)
+                    for value in db_data.get("hardware_breakpoints", [])
+                }
+                self.bookmarks = {
+                    int(k): str(v) for k, v in db_data.get("bookmarks", {}).items()
+                }
+                if db_data.get("types"):
+                    self.local_types_view.set_definitions(db_data["types"])
+                self.refresh_breakpoint_list()
             for node in self.graph_view.nodes.values():
                 node.update_content()
             self.flat_view.populate(self.blocks)
@@ -1900,6 +3861,8 @@ class GandonPRO(QMainWindow):
             self.string_lookup[va] = match.group().decode("ascii", errors="ignore")
 
     def load_binary(self, path: str):
+        if self.dbg.is_running:
+            self.dbg.stop()
         self.current_binary_path = path
         try:
             with open(path, "rb") as f:
@@ -1909,6 +3872,19 @@ class GandonPRO(QMainWindow):
             return
 
         self.patch_history.clear()
+        self.patch_undo_stack.clear()
+        self.patch_redo_stack.clear()
+        self.functions.clear()
+        self.call_graph.clear()
+        self.auto_names.clear()
+        self.breakpoints.clear()
+        self.dbg.breakpoint_conditions.clear()
+        self.dbg.requested_hardware_breakpoints.clear()
+        self.dbg.hardware_breakpoints.clear()
+        self.dbg.requested_breakpoints.clear()
+        self.dbg.runtime_breakpoints.clear()
+        self.dbg.pending_reinsert = None
+        self.refresh_breakpoint_list()
 
         if self.raw_data.startswith(b"MZ"):
             self.is_elf = False
@@ -1924,6 +3900,13 @@ class GandonPRO(QMainWindow):
             self.image_base = self.pe.OPTIONAL_HEADER.ImageBase
             ep_rva = getattr(self.pe.OPTIONAL_HEADER, "AddressOfEntryPoint", 0)
             entry_va = self.image_base + ep_rva if ep_rva else self.image_base
+
+            if hasattr(self.pe, "DIRECTORY_ENTRY_EXPORT"):
+                for exp in self.pe.DIRECTORY_ENTRY_EXPORT.symbols:
+                    if exp.name:
+                        self.auto_names[self.image_base + exp.address] = (
+                            exp.name.decode(errors="ignore")
+                        )
 
         elif self.raw_data.startswith(b"\x7fELF"):
             self.is_elf = True
@@ -1957,9 +3940,35 @@ class GandonPRO(QMainWindow):
         if self.pe:
             self.imports_view.load_imports(self.pe)
             self.exports_view.load_exports(self.pe, self.image_base)
+            self.resources_view.load_resources(self.pe)
+            self.symbols_view.load_pe(self.pe, self.image_base)
+        else:
+            self.symbols_view.load_elf(self.raw_data, self.image_base)
         self.strings_view.extract_strings(self.raw_data, self.image_base)
 
         self.switch_to_gandon_view(entry_va)
+
+    def label_for(self, address, default_prefix="loc"):
+        return self.custom_names.get(
+            address,
+            self.auto_names.get(address, f"{default_prefix}_{address:08X}")
+        )
+
+    def resolve_runtime_address(self, address):
+        """Translate a PE image VA to its ASLR-adjusted process address."""
+        address = int(address)
+        if not self.dbg.is_running or not self.dbg.process_info or self.is_elf:
+            return address
+        if address < self.image_base:
+            return address
+        remote_base = self.dbg._remote_module_base(
+            os.path.basename(self.current_binary_path)
+        )
+        if not remote_base:
+            return address
+        if address >= remote_base:
+            return address
+        return remote_base + (address - self.image_base)
 
     def switch_to_gandon_view(self, target_va: int):
         self.tab_widget.setCurrentIndex(0)
@@ -1975,6 +3984,8 @@ class GandonPRO(QMainWindow):
         self.blocks = {}
         self.edges = []
         self.xrefs_db = {}
+        self.block_instruction_addresses = {}
+        self.functions.add(start_va)
 
         while worklist and len(self.blocks) < max_depth:
             curr_va = worklist.pop(0)
@@ -1990,6 +4001,7 @@ class GandonPRO(QMainWindow):
                 continue
 
             insns = []
+            instruction_addresses = []
             visited.add(curr_va)
 
             try:
@@ -2019,6 +4031,21 @@ class GandonPRO(QMainWindow):
                             continue
 
                 insns.append((insn.mnemonic, op, comment))
+                instruction_addresses.append(insn.address)
+
+                if insn.group(X86_GRP_CALL):
+                    call_target = None
+                    try:
+                        if hasattr(insn, "operands") and insn.operands and insn.operands[0].type == 2:
+                            call_target = insn.operands[0].imm
+                    except Exception:
+                        call_target = None
+                    if call_target:
+                        self.call_graph.setdefault(curr_va, set()).add(call_target)
+                        self.functions.add(call_target)
+                        self.xrefs_db.setdefault(call_target, []).append(
+                            ("Up", "Call", insn.address, f"{insn.mnemonic} {op}")
+                        )
 
                 for hex_m in re.findall(r"0x[0-9a-fA-F]+", op):
                     try:
@@ -2063,6 +4090,7 @@ class GandonPRO(QMainWindow):
 
             if insns:
                 self.blocks[curr_va] = insns
+                self.block_instruction_addresses[curr_va] = instruction_addresses
 
         levels = {addr: 0 for addr in self.blocks}
         for _ in range(len(self.blocks)):
@@ -2099,17 +4127,28 @@ class GandonPRO(QMainWindow):
 
         self.flat_view.populate(self.blocks)
         self.pseudocode_view.decompile(self.blocks, start_va)
+        self.populate_navigation(start_va)
 
         if start_va in self.graph_view.nodes:
             self.graph_view.centerOn(self.graph_view.nodes[start_va])
 
         self.overview.update_viewport()
 
+        for node in self.graph_view.nodes.values():
+            node.update_content()
+
     def populate_navigation(self, entry_va: int):
         self.nav_tree.clear()
         ep_item = QTreeWidgetItem(["_start (EntryPoint)", f"0x{entry_va:08X}"])
         ep_item.setForeground(0, QColor("#4EC9B0"))
         self.nav_tree.addTopLevelItem(ep_item)
+
+        if self.functions:
+            fn_root = QTreeWidgetItem(["Functions", ""])
+            for fn_va in sorted(self.functions):
+                fn_name = self.label_for(fn_va, "sub")
+                fn_root.addChild(QTreeWidgetItem([fn_name, f"0x{fn_va:08X}"]))
+            self.nav_tree.addTopLevelItem(fn_root)
 
         if self.pe and hasattr(self.pe, "DIRECTORY_ENTRY_IMPORT"):
             imp_root = QTreeWidgetItem(["Imports", ""])
@@ -2138,16 +4177,97 @@ class GandonPRO(QMainWindow):
             self.jump_to_address(int(addr_str, 16))
 
     def toggle_breakpoint(self, va):
+        if not va:
+            self.status_bar.showMessage("Select an instruction or block first.")
+            return
         if va in self.breakpoints:
             self.breakpoints.remove(va)
+            self.dbg.remove_user_breakpoint(va, self.image_base)
             self.status_bar.showMessage(f"Breakpoint removed: 0x{va:08X}")
         else:
+            if not self.dbg.set_user_breakpoint(va, self.image_base):
+                self.status_bar.showMessage(f"Could not install breakpoint: 0x{va:08X}")
+                return
             self.breakpoints.add(va)
             self.status_bar.showMessage(f"Breakpoint added: 0x{va:08X}")
 
+        self.refresh_breakpoint_list()
+        for node in self.graph_view.nodes.values():
+            node.update_content()
+
+    def set_conditional_breakpoint(self):
+        self.set_conditional_breakpoint_at(self._selected_breakpoint_address())
+
+    def set_conditional_breakpoint_at(self, va):
+        if not va:
+            self.status_bar.showMessage("Select an instruction first.")
+            return
+        current = self.dbg.breakpoint_conditions.get(va, "RIP == 0x0")
+        expression, ok = QInputDialog.getText(
+            self, "Conditional Breakpoint", "Condition (example: RAX == 0x1):", text=current
+        )
+        if not ok:
+            return
+        if va not in self.breakpoints:
+            self.toggle_breakpoint(va)
+        self.dbg.set_breakpoint_condition(va, expression)
+        self.refresh_breakpoint_list()
+        self.status_bar.showMessage(f"Condition set at 0x{va:08X}: {expression or 'always'}")
+
+    def toggle_hardware_breakpoint(self):
+        self.toggle_hardware_breakpoint_at(self._selected_breakpoint_address())
+
+    def toggle_hardware_breakpoint_at(self, va):
+        if not va:
+            self.status_bar.showMessage("Select an instruction first.")
+            return
+        key = (va, self.image_base)
+        if key in self.dbg.requested_hardware_breakpoints:
+            self.dbg.remove_hardware_breakpoint(va, self.image_base)
+            self.status_bar.showMessage(f"Hardware breakpoint removed: 0x{va:08X}")
+        else:
+            self.dbg.set_hardware_breakpoint(va, self.image_base)
+            self.status_bar.showMessage(f"Hardware breakpoint requested: 0x{va:08X}")
+        self.refresh_breakpoint_list()
+
+    def _selected_breakpoint_address(self):
+        """Use the selected graph block, not a stale entry-point current_va."""
+        for item in self.graph_view.scene.selectedItems():
+            if isinstance(item, BasicBlockItem):
+                return item.addr
+        return self.current_va
+
+    def refresh_breakpoint_list(self):
         self.dbg_widget.bp_list.clear()
-        for bp in self.breakpoints:
-            self.dbg_widget.bp_list.addTopLevelItem(QTreeWidgetItem([f"0x{bp:08X}", "Software INT3"]))
+        for bp in sorted(self.breakpoints):
+            condition = self.dbg.breakpoint_conditions.get(bp, "")
+            kind = "Software INT3" + (f" [{condition}]" if condition else "")
+            item = QTreeWidgetItem([f"0x{bp:08X}", kind])
+            self.dbg_widget.bp_list.addTopLevelItem(item)
+        for va, _base in sorted(self.dbg.requested_hardware_breakpoints):
+            self.dbg_widget.bp_list.addTopLevelItem(
+                QTreeWidgetItem([f"0x{va:08X}", "Hardware execute"])
+            )
+
+    def remove_selected_breakpoint(self):
+        item = self.dbg_widget.bp_list.currentItem()
+        if not item:
+            self.status_bar.showMessage("Select a breakpoint to delete.")
+            return
+        try:
+            va = int(item.text(0), 16)
+        except ValueError:
+            return
+        self.breakpoints.discard(va)
+        self.dbg.breakpoint_conditions.pop(va, None)
+        self.dbg.remove_user_breakpoint(va, self.image_base)
+        self.dbg.remove_hardware_breakpoint(va, self.image_base)
+        self.dbg_widget.bp_list.takeTopLevelItem(
+            self.dbg_widget.bp_list.indexOfTopLevelItem(item)
+        )
+        for node in self.graph_view.nodes.values():
+            node.update_content()
+        self.status_bar.showMessage(f"Breakpoint removed: 0x{va:08X}")
 
     def dbg_continue(self):
         if not self.current_binary_path:
@@ -2161,12 +4281,22 @@ class GandonPRO(QMainWindow):
             self.tab_widget.setCurrentIndex(3)
             self.dbg.start_process(self.current_binary_path)
         else:
-            if self.dbg.stealth_mode:
-                self.dbg.apply_stealth_hooks()
+            if self.breakpoint_box is not None:
+                self.breakpoint_box.close()
+                self.breakpoint_box = None
+            self.dbg.resume()
             self.status_bar.showMessage("Continuing process execution...")
 
     def dbg_stop(self):
         self.dbg.stop()
+
+    def closeEvent(self, event):
+        # Closing the UI must also terminate the debuggee and release the
+        # debug handles; otherwise the next F9 run remains attached to the
+        # stale worker/process until Terminate Process is pressed manually.
+        self.autosave_project()
+        self.dbg.stop()
+        event.accept()
 
     def action_apply_antidebug(self):
         success, msg = self.dbg.apply_stealth_hooks()
@@ -2175,13 +4305,158 @@ class GandonPRO(QMainWindow):
         else:
             QMessageBox.warning(self, "Anti-Debug Bypass", msg)
 
+    def on_dbg_state(self, message):
+        message = str(message)
+        self.debug_event_log.append(message)
+        self.debug_event_log = self.debug_event_log[-1000:]
+        if hasattr(self, "dbg_widget"):
+            self.dbg_widget.append_event(message)
+        self.status_bar.showMessage(message)
+
+    def export_debug_event_log(self):
+        if not self.debug_event_log:
+            QMessageBox.information(self, "Debug Event Log", "The event log is empty.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Debug Event Log", "debug-events.log", "Log files (*.log *.txt);;All files (*)"
+        )
+        if path:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("\n".join(self.debug_event_log) + "\n")
+            self.status_bar.showMessage(f"Debug event log exported: {path}")
+
+    def export_analysis_json(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export Analysis", "analysis.json", "JSON files (*.json)")
+        if not path:
+            return
+        payload = {
+            "file": self.current_binary_path,
+            "image_base": f"0x{self.image_base:X}",
+            "functions": [
+                {"address": f"0x{addr:X}", "name": self.label_for(addr, "sub")}
+                for addr in sorted(self.functions)
+            ],
+            "breakpoints": [
+                {"address": f"0x{addr:X}", "type": "software", "condition": self.dbg.breakpoint_conditions.get(addr, "")}
+                for addr in sorted(self.breakpoints)
+            ] + [
+                {"address": f"0x{addr:X}", "type": "hardware", "condition": ""}
+                for addr, _base in sorted(self.dbg.requested_hardware_breakpoints)
+            ],
+            "bookmarks": {f"0x{addr:X}": name for addr, name in self.bookmarks.items()},
+            "call_graph": {
+                f"0x{src:X}": [f"0x{dst:X}" for dst in sorted(targets)]
+                for src, targets in self.call_graph.items()
+            }
+        }
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+        self.status_bar.showMessage(f"Analysis exported: {path}")
+
+    def export_breakpoints_csv(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export Breakpoints", "breakpoints.csv", "CSV files (*.csv)")
+        if not path:
+            return
+        with open(path, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["address", "type", "condition"])
+            for addr in sorted(self.breakpoints):
+                writer.writerow([f"0x{addr:X}", "software", self.dbg.breakpoint_conditions.get(addr, "")])
+            for addr, _base in sorted(self.dbg.requested_hardware_breakpoints):
+                writer.writerow([f"0x{addr:X}", "hardware", ""])
+        self.status_bar.showMessage(f"Breakpoints exported: {path}")
+
+    def action_search_text(self):
+        if not self.raw_data:
+            QMessageBox.information(self, "Search", "Please load a binary file first.")
+            return
+        query, ok = QInputDialog.getText(
+            self, "Search Text / Address", "ASCII text, hex bytes or address:"
+        )
+        if not ok or not query.strip():
+            return
+        query = query.strip()
+        matches = []
+        try:
+            if re.fullmatch(r"(?:0x)?[0-9a-fA-F]+", query) and len(query.replace("0x", "")) >= 4:
+                address = int(query, 16)
+                self.jump_to_address(address)
+                self.status_bar.showMessage(f"Address search: 0x{address:X}")
+                return
+            if re.fullmatch(r"(?:[0-9a-fA-F]{2}\s*)+", query):
+                needle = bytes.fromhex(query)
+            else:
+                needle = query.encode("utf-8")
+            start = 0
+            while needle:
+                offset = self.raw_data.find(needle, start)
+                if offset < 0:
+                    break
+                va = self.image_base + (offset if self.is_elf else self.pe.get_rva_from_offset(offset))
+                matches.append((offset, va))
+                start = offset + 1
+        except Exception as exc:
+            QMessageBox.warning(self, "Search Error", str(exc))
+            return
+        if not matches:
+            QMessageBox.information(self, "Search", "No matches found.")
+            return
+        self.jump_to_address(matches[0][1])
+        self.status_bar.showMessage(f"Search matches: {len(matches)}")
+        PatternResultsDialog(self, matches, query, self).exec()
+
     def on_dbg_registers(self, regs):
         self.dbg_widget.update_registers(regs)
+        if self.watch_dialog is not None:
+            self.watch_dialog.update_registers(regs)
+
+    def on_dbg_step_finished(self, addr):
+        if addr:
+            display_addr = addr
+            if self.dbg.is_running and self.dbg.process_info:
+                remote_base = self.dbg._remote_module_base(
+                    os.path.basename(self.current_binary_path)
+                )
+                if remote_base and addr >= remote_base:
+                    display_addr = self.image_base + (addr - remote_base)
+            self.jump_to_address(display_addr)
+            self.set_current_instruction(display_addr)
+            self.status_bar.showMessage(
+                f"Single-step stopped at 0x{display_addr:X}. Press F7/F8 or F9."
+            )
 
     def on_dbg_bp_hit(self, addr):
+        # The first loader breakpoint is filtered in the debugger loop. Any
+        # later non-zero address is a real target INT3 or user breakpoint.
+        if not addr:
+            return
+        # EXCEPTION_RECORD contains a runtime address after ASLR. Convert it
+        # back to the image VA used by the static disassembly before jumping.
+        display_addr = addr
+        if self.dbg.is_running and self.dbg.process_info:
+            remote_base = self.dbg._remote_module_base(
+                os.path.basename(self.current_binary_path)
+            )
+            if remote_base and addr >= remote_base:
+                display_addr = self.image_base + (addr - remote_base)
         self.tab_widget.setCurrentIndex(0)
-        self.jump_to_address(addr)
-        QMessageBox.information(self, "Breakpoint", f"Breakpoint Hit at address: 0x{addr:08X}")
+        self.jump_to_address(display_addr)
+        self.set_current_instruction(display_addr)
+        if self.breakpoint_box is not None:
+            self.breakpoint_box.close()
+        self.breakpoint_box = QMessageBox(self)
+        self.breakpoint_box.setIcon(QMessageBox.Icon.Information)
+        self.breakpoint_box.setWindowTitle("Breakpoint")
+        self.breakpoint_box.setText(
+            f"Breakpoint hit at address: 0x{display_addr:08X}\nPress F9 to continue."
+        )
+        self.breakpoint_box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        self.breakpoint_box.setModal(False)
+        self.breakpoint_box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.breakpoint_box.finished.connect(
+            lambda _result: setattr(self, "breakpoint_box", None)
+        )
+        self.breakpoint_box.open()
 
 
 if __name__ == "__main__":
