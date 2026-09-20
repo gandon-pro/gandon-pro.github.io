@@ -9,6 +9,13 @@
   <meta property="og:description" content="Interactive PE/ELF disassembly, CFG visualization and Win32 debugging tools.">
   <meta property="og:type" content="website">
   <meta name="twitter:card" content="summary">
+  <script>
+    try {
+      if (localStorage.getItem('gandon-theme') === 'dark') {
+        document.documentElement.dataset.theme = 'dark';
+      }
+    } catch (_) {}
+  </script>
   <title>Gandon-PRO — Binary Analysis, Debugging and CFG</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -42,6 +49,28 @@
       transition: background-color .25s, color .25s;
     }
     [data-theme="dark"] body { background: #111827; }
+    [data-theme="dark"] .hero {
+      background: radial-gradient(circle at 86% 22%, rgba(16, 185, 129, .12) 0, transparent 28%),
+                  linear-gradient(135deg, #0b0f14 0%, #111827 58%, #0f172a 100%);
+      border-bottom-color: #263241;
+    }
+    [data-theme="dark"] .hero::after { background: rgba(148, 163, 184, .035); }
+    [data-theme="dark"] .navbar { background: rgba(15, 23, 42, .9); border-color: #334155; }
+    [data-theme="dark"] .brand { color: #f8fafc; }
+    [data-theme="dark"] .hero h1 { color: #d1fae5; }
+    [data-theme="dark"] .hero .eyebrow,
+    [data-theme="dark"] .hero .lead,
+    [data-theme="dark"] .hero .stat strong,
+    [data-theme="dark"] .hero .stat span { color: #a7f3d0; }
+    [data-theme="dark"] .hero .eyebrow::before { background: #a7f3d0; }
+    [data-theme="dark"] .menu-toggle { background: #1e293b; color: #e5e7eb; border-color: #475569; }
+    [data-theme="dark"] .theme-toggle { color: #d1fae5; background: transparent; }
+    [data-theme="dark"] .theme-toggle:hover { background: #1e293b; }
+    [data-theme="dark"] .button:not(.theme-toggle) { background: #d1fae5; color: #064e3b; }
+    [data-theme="dark"] .button:not(.theme-toggle):hover { background: #a7f3d0; color: #022c22; }
+    [data-theme="dark"] .outline { background: transparent; color: #d1fae5; }
+    [data-theme="dark"] footer { background: #111827; color: #94a3b8; }
+    [data-theme="dark"] footer a { color: #a7f3d0; }
     [data-theme="dark"] .card, [data-theme="dark"] .feature { background: #1e293b; border-color: var(--line); }
     [data-theme="dark"] h2, [data-theme="dark"] h3, [data-theme="dark"] footer { color: #e5e7eb; }
     [data-theme="dark"] .card p, [data-theme="dark"] .feature p { color: #cbd5e1; }
