@@ -1,206 +1,203 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Gandon-PRO is an interactive PE/ELF disassembler and Win32 debugger.">
-  <meta name="theme-color" content="#10b981">
+  <meta name="theme-color" content="#0b0f14">
   <meta property="og:title" content="Gandon-PRO — Binary Analysis and Debugging">
   <meta property="og:description" content="Interactive PE/ELF disassembly, CFG visualization and Win32 debugging tools.">
   <meta property="og:type" content="website">
-  <meta name="twitter:card" content="summary">
-  <script>
-    try {
-      if (localStorage.getItem('gandon-theme') === 'dark') {
-        document.documentElement.dataset.theme = 'dark';
-      }
-    } catch (_) {}
-  </script>
+  <meta name="color-scheme" content="dark light">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Crect width='48' height='48' rx='12' fill='%23182330'/%3E%3Cpath d='m11 15 11 9-11 9' fill='none' stroke='%2355ddb0' stroke-width='4' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M25 33h12' stroke='%2355ddb0' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
   <title>Gandon-PRO — Binary Analysis, Debugging and CFG</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <script>
+    try {
+      const saved = localStorage.getItem('gandon-theme');
+      if (saved === 'light' || saved === 'dark') document.documentElement.dataset.theme = saved;
+    } catch (_) {}
+  </script>
   <style>
     :root {
-      --ink: #0f172a;
-      --muted: #4b5563;
-      --green: #059669;
-      --mint: #d1fae5;
-      --line: #dce7e2;
-      --surface: rgba(255, 255, 255, .9);
-      --shadow: 0 16px 45px rgba(6, 78, 59, .12);
+      color-scheme: dark;
+      --page: #0b0f14;
+      --page-raised: #101720;
+      --surface: #131c26;
+      --surface-strong: #182330;
+      --surface-hover: #1d2b39;
+      --line: #263443;
+      --line-strong: #344759;
+      --ink: #edf3f8;
+      --muted: #9aabba;
+      --subtle: #718397;
+      --accent: #55ddb0;
+      --accent-strong: #2bc995;
+      --accent-ink: #06251b;
+      --code: #091119;
+      --shadow: 0 24px 70px rgba(0, 0, 0, .28);
+      --header: rgba(11, 15, 20, .78);
     }
-    [data-theme="dark"] {
-      --ink: #e5e7eb;
-      --muted: #a7b0bd;
-      --line: #334155;
-      --surface: rgba(15, 23, 42, .88);
-      --shadow: 0 16px 45px rgba(0, 0, 0, .24);
+    :root[data-theme="light"] {
+      color-scheme: light;
+      --page: #f4f7f8;
+      --page-raised: #edf2f3;
+      --surface: #ffffff;
+      --surface-strong: #f8fbfb;
+      --surface-hover: #edf5f2;
+      --line: #dce5e6;
+      --line-strong: #c5d2d4;
+      --ink: #17232c;
+      --muted: #536572;
+      --subtle: #687d8a;
+      --accent: #087e5a;
+      --accent-strong: #06694b;
+      --accent-ink: #ffffff;
+      --code: #edf3f5;
+      --shadow: 0 20px 55px rgba(23, 48, 58, .09);
+      --header: rgba(244, 247, 248, .84);
     }
-
     *, *::before, *::after { box-sizing: border-box; }
-    html { scroll-behavior: smooth; }
+    html { scroll-behavior: smooth; scroll-padding-top: 100px; }
     body {
       margin: 0;
-      font-family: Inter, system-ui, sans-serif;
       color: var(--ink);
-      background: #f8fbfa;
+      background: var(--page);
+      font-family: Manrope, system-ui, sans-serif;
       -webkit-font-smoothing: antialiased;
-      transition: background-color .25s, color .25s;
+      transition: color .2s ease, background-color .2s ease;
     }
-    [data-theme="dark"] body { background: #111827; }
-    [data-theme="dark"] .hero {
-      background: radial-gradient(circle at 86% 22%, rgba(16, 185, 129, .12) 0, transparent 28%),
-                  linear-gradient(135deg, #0b0f14 0%, #111827 58%, #0f172a 100%);
-      border-bottom-color: #263241;
-    }
-    [data-theme="dark"] .hero::after { background: rgba(148, 163, 184, .035); }
-    [data-theme="dark"] .navbar { background: rgba(15, 23, 42, .9); border-color: #334155; }
-    [data-theme="dark"] .brand { color: #f8fafc; }
-    [data-theme="dark"] .hero h1 { color: #d1fae5; }
-    [data-theme="dark"] .hero .eyebrow,
-    [data-theme="dark"] .hero .lead,
-    [data-theme="dark"] .hero .stat strong,
-    [data-theme="dark"] .hero .stat span { color: #a7f3d0; }
-    [data-theme="dark"] .hero .eyebrow::before { background: #a7f3d0; }
-    [data-theme="dark"] .menu-toggle { background: #1e293b; color: #e5e7eb; border-color: #475569; }
-    [data-theme="dark"] .theme-toggle { color: #d1fae5; background: transparent; }
-    [data-theme="dark"] .theme-toggle:hover { background: #1e293b; }
-    [data-theme="dark"] .button:not(.theme-toggle) { background: #d1fae5; color: #064e3b; }
-    [data-theme="dark"] .button:not(.theme-toggle):hover { background: #a7f3d0; color: #022c22; }
-    [data-theme="dark"] .outline { background: transparent; color: #d1fae5; }
-    [data-theme="dark"] footer { background: #111827; color: #94a3b8; }
-    [data-theme="dark"] footer a { color: #a7f3d0; }
-    [data-theme="dark"] .card, [data-theme="dark"] .feature { background: #1e293b; border-color: var(--line); }
-    [data-theme="dark"] h2, [data-theme="dark"] h3, [data-theme="dark"] footer { color: #e5e7eb; }
-    [data-theme="dark"] .card p, [data-theme="dark"] .feature p { color: #cbd5e1; }
-    [data-theme="dark"] .nav-links a, [data-theme="dark"] .text-link { color: #d1fae5; }
-    [data-theme="dark"] .outline { background: #1e293b; color: #e5e7eb; border-color: #64748b; }
     a { color: inherit; }
-    a:focus-visible, button:focus-visible {
-      outline: 3px solid #fbbf24;
-      outline-offset: 3px;
-    }
-    .hero {
-      position: relative;
-      overflow: hidden;
-      background: linear-gradient(135deg, #ecfdf5 0%, #a7f3d0 35%, #34d399 70%, #10b981 100%);
-      border-bottom: 1px solid rgba(6, 78, 59, .12);
-    }
-    .hero::after {
-      content: "";
-      position: absolute;
-      inset: auto -10% -130px 35%;
-      height: 260px;
-      background: rgba(255, 255, 255, .2);
-      transform: rotate(-8deg);
-      border-radius: 50%;
-      pointer-events: none;
-    }
-    .portrait {
-      position: absolute;
-      right: 4%;
-      top: 50%;
-      width: clamp(250px, 31vw, 440px);
-      aspect-ratio: 1;
-      transform: translateY(-40%);
-      border-radius: 50%;
-      background: url("https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSXUZJKTeH1k3qfSP61Rui3VuQrGMQ5zlMmmAz4F5x3NN1QRFZq") center/cover no-repeat;
-      opacity: .2;
-      filter: contrast(160%) grayscale(20%);
-      mix-blend-mode: multiply;
-      mask-image: radial-gradient(circle, #000 38%, transparent 74%);
-      pointer-events: none;
-    }
-    .container { width: min(1200px, calc(100% - 40px)); margin-inline: auto; }
-    .nav-wrap { position: relative; z-index: 2; padding-top: 24px; }
-    .navbar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 20px;
-      padding: 10px 18px 10px 24px;
-      border: 1px solid rgba(255, 255, 255, .8);
-      border-radius: 14px;
-      background: var(--surface);
-      box-shadow: var(--shadow);
-      backdrop-filter: blur(12px);
-    }
-    .brand { display: inline-flex; align-items: center; gap: 10px; text-decoration: none; font-weight: 800; letter-spacing: -.5px; }
-    .brand-icon { display: grid; place-items: center; width: 34px; height: 34px; border-radius: 9px; color: #34d399; background: var(--ink); font-size: 14px; }
-    .nav-links { display: flex; align-items: center; gap: 24px; margin: 0; padding: 0; list-style: none; }
-    .nav-links a { color: #374151; font-size: 13px; font-weight: 600; text-decoration: none; }
-    .nav-links a:hover { color: var(--green); }
-    .button {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      gap: 8px;
-      min-height: 42px;
-      padding: 0 18px;
-      border: 0;
-      border-radius: 9px;
-      background: var(--ink);
-      color: #fff;
-      font: inherit;
-      font-size: 13px;
-      font-weight: 700;
-      text-decoration: none;
-      cursor: pointer;
-      transition: transform .2s, background .2s, box-shadow .2s;
-    }
-    .button:hover { transform: translateY(-2px); background: #1e293b; box-shadow: 0 8px 20px rgba(15, 23, 42, .18); }
-    .menu-toggle { display: none; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: #fff; color: var(--ink); cursor: pointer; }
-    .theme-toggle { min-height: 34px; padding: 0 11px; background: transparent; color: var(--ink); border: 1px solid var(--line); font-size: 12px; }
-    .theme-toggle:hover { background: rgba(255, 255, 255, .35); box-shadow: none; }
-    .hero-content { position: relative; z-index: 1; padding: 92px 0 116px; }
-    .eyebrow { display: inline-flex; align-items: center; gap: 8px; margin-bottom: 18px; color: #065f46; font-size: 12px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
-    .eyebrow::before { content: ""; width: 28px; height: 2px; background: #065f46; }
-    h1 { max-width: 680px; margin: 0 0 22px; color: #064e3b; font-size: clamp(2.35rem, 5vw, 4rem); line-height: 1.08; letter-spacing: -1.8px; }
-    .lead { max-width: 570px; margin: 0 0 32px; color: #065f46; font-size: 16px; line-height: 1.7; }
-    .cta { display: flex; align-items: center; flex-wrap: wrap; gap: 18px; }
-    .text-link { color: #064e3b; font-size: 14px; font-weight: 800; text-decoration: none; }
-    .text-link:hover { text-decoration: underline; }
-    .stats { display: flex; flex-wrap: wrap; gap: 24px; margin-top: 48px; }
-    .stat { min-width: 115px; }
-    .stat strong { display: block; color: #064e3b; font-size: 21px; }
-    .stat span { color: #047857; font-size: 12px; }
-    main { padding-bottom: 70px; }
-    .cards { display: grid; grid-template-columns: repeat(2, 1fr); gap: 24px; margin-top: -42px; position: relative; z-index: 3; }
-    .card { display: flex; flex-direction: column; justify-content: space-between; min-height: 260px; padding: 28px; border: 1px solid var(--line); border-radius: 14px; background: #fff; box-shadow: 0 12px 35px rgba(15, 23, 42, .07); }
-    .badge { display: inline-flex; align-items: center; gap: 7px; margin-bottom: 14px; color: var(--green); font-size: 12px; font-weight: 800; }
-    .dot { width: 8px; height: 8px; border-radius: 50%; background: #10b981; box-shadow: 0 0 0 4px #d1fae5; }
-    h2 { margin: 0; font-size: clamp(1.8rem, 3vw, 2.5rem); letter-spacing: -1px; }
-    h3 { margin: 0 0 10px; font-size: 20px; }
-    .card p, .feature p { color: var(--muted); font-size: 14px; line-height: 1.65; }
-    .card p { margin: 0 0 24px; }
-    .outline { background: #fff; color: var(--ink); border: 1px solid #cbd5e1; }
-    .outline:hover { background: #f8fafc; }
-    .section { padding-top: 92px; }
-    .section-heading { max-width: 620px; margin-bottom: 32px; }
-    .section-heading p { color: var(--muted); line-height: 1.7; }
-    .features { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
-    .feature { padding: 22px; border: 1px solid var(--line); border-radius: 12px; background: #fff; }
-    .feature-icon { display: grid; place-items: center; width: 38px; height: 38px; margin-bottom: 16px; border-radius: 10px; background: var(--mint); color: var(--green); font-weight: 800; }
+    a:focus-visible, button:focus-visible, summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+    button { font: inherit; }
+    .container { width: min(1160px, calc(100% - 48px)); margin-inline: auto; }
+    .site-header { position: sticky; z-index: 20; top: 0; padding: 14px 0; background: var(--header); border-bottom: 1px solid color-mix(in srgb, var(--line) 70%, transparent); backdrop-filter: blur(18px); }
+    .navbar { position: relative; display: flex; align-items: center; justify-content: space-between; gap: 26px; min-height: 54px; }
+    .brand { display: inline-flex; align-items: center; gap: 11px; flex: 0 0 auto; text-decoration: none; font-size: 15px; font-weight: 800; letter-spacing: -.045em; }
+    .brand-icon { display: grid; place-items: center; width: 36px; height: 36px; flex: 0 0 auto; border: 1px solid var(--line-strong); border-radius: 10px; color: var(--accent); background: var(--surface-strong); font: 500 13px "DM Mono", monospace; }
+    .nav-links { display: flex; align-items: center; justify-content: center; gap: clamp(16px, 2.5vw, 32px); margin: 0; padding: 0; list-style: none; }
+    .nav-links a { color: var(--muted); text-decoration: none; font-size: 12px; font-weight: 700; transition: color .15s ease; }
+    .nav-links a:hover, .nav-links a[aria-current="location"] { color: var(--accent); }
+    .nav-actions { display: flex; align-items: center; gap: 9px; }
+    .button { display: inline-flex; align-items: center; justify-content: center; gap: 9px; min-height: 42px; padding: 0 16px; border: 1px solid transparent; border-radius: 9px; color: var(--accent-ink); background: var(--accent); text-decoration: none; font-size: 12px; font-weight: 800; cursor: pointer; transition: background .16s ease, border-color .16s ease, color .16s ease, transform .16s ease; }
+    .button:hover { transform: translateY(-1px); background: var(--accent-strong); }
+    .button.secondary { color: var(--ink); background: var(--surface); border-color: var(--line-strong); }
+    .button.secondary:hover { background: var(--surface-hover); border-color: var(--accent); }
+    .button.quiet { min-height: 38px; color: var(--muted); background: transparent; border-color: var(--line); }
+    .button.quiet:hover { color: var(--ink); background: var(--surface); }
+    .menu-toggle { display: none; width: 40px; height: 40px; place-items: center; border: 1px solid var(--line); border-radius: 9px; color: var(--ink); background: var(--surface); cursor: pointer; }
+    .hero { position: relative; isolation: isolate; overflow: hidden; border-bottom: 1px solid var(--line); background: radial-gradient(ellipse at 83% 17%, color-mix(in srgb, var(--accent) 13%, transparent), transparent 35%), linear-gradient(145deg, var(--page) 20%, var(--page-raised)); }
+    .hero::before { position: absolute; z-index: -1; inset: 0; content: ""; opacity: .2; background-image: linear-gradient(color-mix(in srgb, var(--line) 35%, transparent) 1px, transparent 1px), linear-gradient(90deg, color-mix(in srgb, var(--line) 35%, transparent) 1px, transparent 1px); background-size: 58px 58px; mask-image: linear-gradient(90deg, transparent 22%, #000 100%); }
+    .hero-portrait { position: absolute; z-index: 0; top: 7%; right: max(28px, calc((100vw - 1160px) / 2 + 18px)); width: clamp(280px, 34vw, 455px); aspect-ratio: 1; opacity: .2; pointer-events: none; mask-image: radial-gradient(ellipse, #000 38%, transparent 76%); }
+    .hero-portrait img { display: block; width: 100%; height: 100%; object-fit: cover; filter: grayscale(.35) contrast(1.08); mix-blend-mode: screen; }
+    .hero-content { padding: clamp(76px, 11vw, 132px) 0 110px; }
+    .hero-copy { max-width: 710px; }
+    .eyebrow { display: inline-flex; align-items: center; gap: 10px; margin-bottom: 22px; color: var(--accent); font: 500 11px "DM Mono", monospace; letter-spacing: .12em; text-transform: uppercase; }
+    .eyebrow::before { width: 24px; height: 1px; content: ""; background: currentColor; }
+    h1 { max-width: 720px; margin: 0; font-size: clamp(2.7rem, 7vw, 5.2rem); line-height: 1.02; letter-spacing: -.075em; }
+    h1 span { color: var(--accent); }
+    .lead { max-width: 590px; margin: 24px 0 30px; color: var(--muted); font-size: clamp(15px, 1.5vw, 17px); line-height: 1.8; }
+    .cta { display: flex; align-items: center; flex-wrap: wrap; gap: 11px; }
+    .hero-meta { display: flex; flex-wrap: wrap; gap: 30px; margin-top: 55px; }
+    .stat { display: grid; gap: 4px; }
+    .stat strong { font-size: 14px; letter-spacing: -.02em; }
+    .stat span { color: var(--subtle); font-size: 11px; }
+    .hero-terminal { position: absolute; right: max(24px, calc((100vw - 1160px) / 2)); bottom: 106px; width: min(370px, 32vw); padding: 16px 18px; overflow: hidden; border: 1px solid var(--line-strong); border-radius: 12px; color: var(--muted); background: color-mix(in srgb, var(--surface) 92%, transparent); box-shadow: var(--shadow); font: 11px/1.9 "DM Mono", monospace; }
+    .terminal-top { display: flex; gap: 6px; align-items: center; margin-bottom: 13px; padding-bottom: 11px; border-bottom: 1px solid var(--line); color: var(--subtle); }
+    .terminal-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
+    .terminal-line { white-space: nowrap; }
+    .terminal-line b { color: var(--accent); font-weight: 500; }
+    .cards { position: relative; z-index: 2; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-top: -38px; }
+    .card { display: flex; flex-direction: column; align-items: flex-start; justify-content: space-between; gap: 30px; min-height: 220px; padding: 25px; border: 1px solid var(--line); border-radius: 13px; background: var(--surface); box-shadow: var(--shadow); }
+    .badge { display: inline-flex; align-items: center; gap: 8px; margin-bottom: 14px; color: var(--accent); font: 500 10px "DM Mono", monospace; letter-spacing: .07em; text-transform: uppercase; }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent); }
+    h2 { margin: 0; font-size: clamp(1.8rem, 4vw, 2.6rem); line-height: 1.1; letter-spacing: -.06em; }
+    h3 { margin: 0 0 9px; font-size: 17px; letter-spacing: -.035em; }
+    .card p, .feature p, .section-heading p { color: var(--muted); font-size: 13px; line-height: 1.75; }
+    .card p { max-width: 520px; margin: 0; }
+    .section { padding-top: 112px; }
+    .section-heading { display: flex; align-items: end; justify-content: space-between; gap: 32px; margin-bottom: 28px; }
+    .section-heading > div { max-width: 630px; }
+    .section-heading .eyebrow { margin-bottom: 15px; }
+    .section-heading p { max-width: 560px; margin: 12px 0 0; }
+    .section-kicker { color: var(--subtle); font: 11px "DM Mono", monospace; }
+    .features { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 13px; }
+    .feature { min-height: 190px; padding: 21px; border: 1px solid var(--line); border-radius: 11px; background: var(--surface); }
+    .feature-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 30px; }
+    .feature-icon { display: grid; place-items: center; width: 34px; height: 34px; border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--line)); border-radius: 9px; color: var(--accent); background: color-mix(in srgb, var(--accent) 9%, var(--surface)); font: 11px "DM Mono", monospace; }
+    .feature-index { color: var(--subtle); font: 10px "DM Mono", monospace; }
     .feature p { margin: 0; }
-    footer { padding: 28px 0 36px; border-top: 1px solid var(--line); color: #64748b; font-size: 12px; }
-    footer .container { display: flex; justify-content: space-between; gap: 18px; }
-    @media (max-width: 860px) {
-      .portrait { opacity: .1; right: -80px; }
-      .nav-links, .navbar > .button { display: none; }
-      .menu-toggle { display: inline-flex; }
-      .navbar.is-open { flex-wrap: wrap; }
-      .navbar.is-open .nav-links { display: grid; flex-basis: 100%; gap: 14px; padding: 12px 0 6px; }
-      .hero-content { padding: 72px 0 95px; }
-      .cards, .features { grid-template-columns: 1fr; }
-      .cards { margin-top: 24px; }
+    .product-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 15px; }
+    .product { display: flex; flex-direction: column; padding: 24px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); transition: border-color .18s ease, transform .18s ease; }
+    .product:hover { transform: translateY(-3px); border-color: var(--line-strong); }
+    .product-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 18px; }
+    .product-mark { display: grid; place-items: center; width: 43px; height: 43px; border: 1px solid var(--line); border-radius: 11px; color: var(--accent); background: var(--surface-strong); font: 12px "DM Mono", monospace; }
+    .product-tag { padding: 5px 8px; border: 1px solid var(--line); border-radius: 99px; color: var(--muted); font: 9px "DM Mono", monospace; text-transform: uppercase; }
+    .product p { min-height: 45px; margin: 0 0 19px; color: var(--muted); font-size: 12px; line-height: 1.75; }
+    .product ul { display: grid; gap: 8px; margin: 0 0 23px; padding: 0; list-style: none; color: var(--muted); font-size: 11px; }
+    .product li::before { margin-right: 8px; color: var(--accent); content: "✓"; }
+    .product .button { align-self: flex-start; margin-top: auto; }
+    .docs-layout { display: grid; grid-template-columns: .85fr 1.15fr; gap: 28px; align-items: start; }
+    .docs-intro { position: sticky; top: 105px; }
+    .docs-intro p { max-width: 400px; margin: 14px 0 22px; color: var(--muted); font-size: 13px; line-height: 1.8; }
+    .doc-list { display: grid; gap: 9px; }
+    .doc-item { padding: 18px 19px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+    .doc-item summary { display: flex; align-items: center; justify-content: space-between; gap: 16px; cursor: pointer; list-style: none; font-size: 13px; font-weight: 800; }
+    .doc-item summary::-webkit-details-marker { display: none; }
+    .doc-item summary::after { color: var(--accent); content: "+"; font: 18px "DM Mono", monospace; }
+    .doc-item[open] summary::after { content: "−"; }
+    .doc-item p, .doc-item ol { margin: 12px 0 0; color: var(--muted); font-size: 12px; line-height: 1.8; }
+    .doc-item ol { padding-left: 20px; }
+    code, kbd { padding: 2px 5px; border: 1px solid var(--line); border-radius: 5px; background: var(--code); font: 10px "DM Mono", monospace; }
+    .doc-actions { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 18px; }
+    .release-band { display: flex; align-items: center; justify-content: space-between; gap: 28px; margin-top: 100px; padding: clamp(24px, 5vw, 42px); border: 1px solid var(--line-strong); border-radius: 14px; background: radial-gradient(ellipse at 100% 0%, color-mix(in srgb, var(--accent) 10%, transparent), transparent 55%), var(--surface); }
+    .release-band p { margin: 8px 0 0; color: var(--muted); font-size: 12px; line-height: 1.7; }
+    footer { margin-top: 100px; padding: 25px 0 34px; border-top: 1px solid var(--line); color: var(--subtle); font-size: 11px; }
+    footer .container { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
+    .footer-links { display: flex; gap: 18px; }
+    footer a { color: var(--muted); text-decoration: none; }
+    footer a:hover { color: var(--accent); }
+    @media (max-width: 900px) {
+      .hero-terminal { right: 24px; width: 300px; opacity: .75; }
+      .hero-portrait { right: -45px; opacity: .15; }
+      .hero-copy { max-width: 620px; }
+      .nav-links { gap: 15px; }
+      .features { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
-    @media (max-width: 520px) {
-      .container { width: min(100% - 28px, 1200px); }
-      .navbar { padding-inline: 14px; }
-      .hero-content { padding-top: 56px; }
-      .cta, footer .container { align-items: flex-start; flex-direction: column; }
-      .stats { gap: 16px; }
+    @media (max-width: 720px) {
+      .container { width: min(100% - 32px, 1160px); }
+      .site-header { padding: 9px 0; }
+      .navbar { flex-wrap: wrap; gap: 10px; }
+      .menu-toggle { display: grid; margin-left: auto; }
+      .nav-actions { order: 1; }
+      .nav-actions .github-link { display: none; }
+      .nav-links { display: none; order: 2; flex-basis: 100%; align-items: stretch; gap: 0; padding: 5px 0 8px; border-top: 1px solid var(--line); }
+      .navbar.is-open .nav-links { display: grid; }
+      .nav-links a { display: block; padding: 11px 3px; }
+      .hero-content { padding: 78px 0 90px; }
+      .hero-terminal { display: none; }
+      .hero-portrait { top: 0; right: -105px; width: 300px; opacity: .11; }
+      .cards, .product-grid, .docs-layout { grid-template-columns: 1fr; }
+      .cards { margin-top: -28px; }
+      .card { min-height: 195px; }
+      .section { padding-top: 82px; }
+      .section-heading { align-items: flex-start; flex-direction: column; gap: 12px; }
+      .docs-intro { position: static; }
+      .release-band { align-items: flex-start; flex-direction: column; margin-top: 78px; }
+      footer { margin-top: 78px; }
+    }
+    @media (max-width: 480px) {
+      .container { width: calc(100% - 28px); }
+      h1 { font-size: clamp(2.6rem, 13vw, 4rem); }
+      .hero-content { padding-top: 64px; }
+      .hero-meta { gap: 18px; margin-top: 40px; }
+      .stat { min-width: calc(50% - 18px); }
+      .features { grid-template-columns: 1fr; }
+      .feature { min-height: 165px; }
+      .cta .button { width: 100%; }
+      footer .container { align-items: flex-start; flex-direction: column; }
     }
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; }
@@ -208,92 +205,174 @@
   </style>
 </head>
 <body>
-  <header class="hero" id="top">
-    <div class="portrait" aria-hidden="true"></div>
-    <div class="container nav-wrap">
+  <header class="site-header" id="top">
+    <div class="container">
       <nav class="navbar" aria-label="Main navigation">
-        <a class="brand" href="#top" aria-label="Gandon-PRO home"><span class="brand-icon">&gt;_</span>gandon-pro</a>
-        <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="site-links">Menu</button>
+        <a class="brand" href="#top" aria-label="Gandon-PRO home"><span class="brand-icon" aria-hidden="true">&gt;_</span>gandon-pro</a>
+        <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="site-links" aria-label="Open navigation menu"><span aria-hidden="true">☰</span></button>
         <ul class="nav-links" id="site-links">
-          <li><a href="#features">Products</a></li>
-          <li><a href="https://github.com/gandon-pro/gandon-pro.github.io/tree/main/src">Architecture</a></li>
-          <li><a href="#docs">Documentation</a></li>
+          <li><a href="#products">Products</a></li>
+          <li><a href="#architecture">Architecture</a></li>
+          <li><a href="#documentation">Documentation</a></li>
           <li><a href="https://github.com/gandon-pro/gandon-pro.github.io/releases">Releases</a></li>
         </ul>
-        <div style="display:flex;align-items:center;gap:10px">
-          <button class="button theme-toggle" type="button" aria-label="Toggle color theme" aria-pressed="false">◐ Theme: Light</button>
-          <a class="button" href="https://github.com/gandon-pro/">GitHub Profile</a>
+        <div class="nav-actions">
+          <button class="button quiet theme-toggle" type="button" aria-label="Switch to light theme" aria-pressed="true"><span aria-hidden="true">◐</span><span class="theme-label">Dark</span></button>
+          <a class="button github-link" href="https://github.com/gandon-pro/">GitHub <span aria-hidden="true">↗</span></a>
         </div>
       </nav>
     </div>
+  </header>
+
+  <section class="hero" aria-labelledby="hero-title">
+    <div class="hero-portrait" aria-hidden="true"><img src="https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSxmahhtxf2HRpvj7SSGiaMeTWYiTegYjn02nDzcrY7ug&amp;s=10" alt=""></div>
     <div class="container hero-content">
-      <div class="eyebrow">Interactive binary analysis</div>
-      <h1>Disassemble, inspect and route with Gandon-PRO.</h1>
-      <p class="lead">An interactive PE/ELF disassembler and Win32 debugger with CFG visualization, symbol inspection, patching and practical debugging tools.</p>
-      <div class="cta">
-        <a class="button" href="https://github.com/gandon-pro/gandon-pro.github.io/releases/download/v2.3-beta/GandonPro-Compiled.rar">Download now <span aria-hidden="true">→</span></a>
-        <a class="text-link" href="https://github.com/gandon-pro/gandon-pro.github.io/tree/main/src">Explore architecture <span aria-hidden="true">→</span></a>
+      <div class="hero-copy">
+        <div class="eyebrow">Interactive binary analysis</div>
+        <h1 id="hero-title">Understand the flow.<br><span>Own the details.</span></h1>
+        <p class="lead">Explore executable files with an interactive disassembler, control flow graphs, symbol inspection and a practical Win32 debugger.</p>
+        <div class="cta">
+          <a class="button" href="https://github.com/gandon-pro/gandon-pro.github.io/releases">Get the latest build <span aria-hidden="true">→</span></a>
+          <a class="button secondary" href="#architecture">Explore the architecture <span aria-hidden="true">↓</span></a>
+        </div>
+        <div class="hero-meta" aria-label="Project highlights">
+          <div class="stat"><strong>PE / ELF</strong><span>Binary formats</span></div>
+          <div class="stat"><strong>CFG + XREF</strong><span>Code navigation</span></div>
+          <div class="stat"><strong>Win32</strong><span>Debug workflow</span></div>
+        </div>
       </div>
-      <div class="stats" aria-label="Project highlights">
-        <div class="stat"><strong>PE / ELF</strong><span>format coverage</span></div>
-        <div class="stat"><strong>CFG + XREF</strong><span>navigation tools</span></div>
-        <div class="stat"><strong>Win32</strong><span>debugger backend</span></div>
+      <div class="hero-terminal" aria-label="Example analysis output">
+        <div class="terminal-top"><span class="terminal-dot"></span><span class="terminal-dot"></span><span class="terminal-dot"></span><span style="margin-left:8px">analysis session</span></div>
+        <div class="terminal-line"><b>image</b>  target.exe</div>
+        <div class="terminal-line"><b>format</b> PE32+ · x86-64</div>
+        <div class="terminal-line"><b>entry</b>  0x140001000</div>
+        <div class="terminal-line"><b>graph</b>  blocks linked · xrefs ready</div>
       </div>
     </div>
-  </header>
+  </section>
 
   <main>
     <div class="container">
-      <section class="cards" aria-label="Latest project updates">
+      <section class="cards" aria-label="Project overview">
         <article class="card">
-          <div><div class="badge"><span class="dot"></span>Latest update</div><h3>Gandon-PRO Beta</h3><p>Explore graph navigation, breakpoint workflows, symbol views and a focused dark IDE-style interface.</p></div>
-          <a class="button" href="https://github.com/gandon-pro/gandon-pro.github.io/releases/tag/v2.3-beta">Read release notes <span aria-hidden="true">→</span></a>
+          <div><div class="badge"><span class="dot"></span>Current release</div><h3>Gandon-PRO Native</h3><p>Browse the latest build and release notes for the native C++ analysis and debugging application.</p></div>
+          <a class="button" href="https://github.com/gandon-pro/gandon-pro.github.io/releases">View releases <span aria-hidden="true">↗</span></a>
         </article>
         <article class="card">
-          <div><div class="badge"><span class="dot"></span>PE inspection core</div><h3>Disassembly &amp; CFG starter</h3><p>Inspect exports, references and function boundaries in x86-64 executable modules.</p></div>
-          <a class="button outline" href="https://github.com/gandon-pro/gandon-pro.github.io/tree/main/src">Inspect the source <span aria-hidden="true">→</span></a>
+          <div><div class="badge"><span class="dot"></span>Open source</div><h3>Built to inspect</h3><p>Follow the C++ core, GUI, command-line frontend and plugin examples in the project source.</p></div>
+          <a class="button secondary" href="https://github.com/gandon-pro/gandon-pro.github.io/tree/main/src">Browse source <span aria-hidden="true">↗</span></a>
         </article>
       </section>
 
-      <section class="section" id="features">
-        <div class="section-heading"><h2>Built for a faster analysis loop.</h2><p>Keep the important context visible while moving from bytes to control flow, symbols and debugger state.</p></div>
+      <section class="section" id="architecture" aria-labelledby="architecture-title">
+        <div class="section-heading">
+          <div><div class="eyebrow">A focused workflow</div><h2 id="architecture-title">From bytes to behavior.</h2><p>Keep code, control flow and debugging context connected while investigating a binary.</p></div>
+          <a class="section-kicker" href="https://github.com/gandon-pro/gandon-pro.github.io/tree/main/src">SOURCE TREE ↗</a>
+        </div>
         <div class="features">
-          <article class="feature"><div class="feature-icon" aria-hidden="true">01</div><h3>Visual CFG</h3><p>Follow branches, calls and cross-references without losing the current function context.</p></article>
-          <article class="feature"><div class="feature-icon" aria-hidden="true">02</div><h3>Live debugging</h3><p>Use breakpoints, registers, memory, stepping and call-stack inspection from one workspace.</p></article>
-          <article class="feature"><div class="feature-icon" aria-hidden="true">03</div><h3>Patch with confidence</h3><p>Edit instructions, review changed bytes and export a patched binary when ready.</p></article>
+          <article class="feature"><div class="feature-top"><span class="feature-icon">CFG</span><span class="feature-index">01 / ANALYZE</span></div><h3>Control flow graphs</h3><p>Follow branches and basic blocks visually, then jump into the instruction listing.</p></article>
+          <article class="feature"><div class="feature-top"><span class="feature-icon">XREF</span><span class="feature-index">02 / NAVIGATE</span></div><h3>Symbols and references</h3><p>Inspect functions, imports, exports, strings and cross references from one workspace.</p></article>
+          <article class="feature"><div class="feature-top"><span class="feature-icon">DBG</span><span class="feature-index">03 / DEBUG</span></div><h3>Interactive debugging</h3><p>Set breakpoints, step through a process and inspect memory while it runs.</p></article>
+          <article class="feature"><div class="feature-top"><span class="feature-icon">PATCH</span><span class="feature-index">04 / MODIFY</span></div><h3>Patch and review</h3><p>Edit instructions, track changed bytes and save a patched binary for review.</p></article>
+          <article class="feature"><div class="feature-top"><span class="feature-icon">EXT</span><span class="feature-index">05 / EXTEND</span></div><h3>Plugin support</h3><p>Extend the application with native plugins and Python-based tools.</p></article>
+          <article class="feature"><div class="feature-top"><span class="feature-icon">CLI</span><span class="feature-index">06 / AUTOMATE</span></div><h3>Command-line frontend</h3><p>Run core binary analysis from the terminal for quick inspection and repeatable tasks.</p></article>
         </div>
       </section>
 
-      <section class="section" id="docs">
-        <div class="section-heading"><h2>Open and inspect.</h2><p>Read the implementation, download the latest build or follow the release history on GitHub.</p></div>
-        <div class="cta"><a class="button" href="https://github.com/gandon-pro/gandon-pro.github.io">Open repository <span aria-hidden="true">→</span></a><a class="text-link" href="https://github.com/gandon-pro/gandon-pro.github.io/releases">Browse releases <span aria-hidden="true">→</span></a></div>
+      <section class="section" id="products" aria-labelledby="products-title">
+        <div class="section-heading">
+          <div><div class="eyebrow">Products</div><h2 id="products-title">Choose your workflow.</h2><p>Start with the desktop interface or use the command line for quick, repeatable inspection.</p></div>
+          <span class="section-kicker">ONE ANALYSIS CORE</span>
+        </div>
+        <div class="product-grid">
+          <article class="product">
+            <div class="product-head"><div class="product-mark">GUI</div><span class="product-tag">Desktop</span></div>
+            <h3>Gandon-PRO Native</h3>
+            <p>A graphical workspace for exploring binaries, following control flow and debugging processes.</p>
+            <ul><li>Graph and text disassembly</li><li>Symbols, imports and cross references</li><li>Breakpoint and memory tools</li></ul>
+            <a class="button" href="https://github.com/gandon-pro/gandon-pro.github.io/releases">Download from Releases <span aria-hidden="true">↗</span></a>
+          </article>
+          <article class="product">
+            <div class="product-head"><div class="product-mark">CLI</div><span class="product-tag">Terminal</span></div>
+            <h3>Gandon-PRO CLI</h3>
+            <p>A compact terminal frontend for inspecting a binary and printing analysis results.</p>
+            <ul><li>Open PE and ELF files</li><li>Review entry point disassembly</li><li>Scriptable command-line workflow</li></ul>
+            <a class="button secondary" href="https://github.com/gandon-pro/gandon-pro.github.io/tree/main/src">Build from source <span aria-hidden="true">↗</span></a>
+          </article>
+        </div>
+      </section>
+
+      <section class="section" id="documentation" aria-labelledby="documentation-title">
+        <div class="docs-layout">
+          <div class="docs-intro">
+            <div class="eyebrow">Documentation</div>
+            <h2 id="documentation-title">Get started.</h2>
+            <p>Open a binary in the desktop app, navigate the graph, or build the native tools from source. Expand a topic for the practical steps.</p>
+            <div class="doc-actions">
+              <a class="button secondary" href="https://github.com/gandon-pro/gandon-pro.github.io">Repository <span aria-hidden="true">↗</span></a>
+              <a class="button quiet" href="https://github.com/gandon-pro/gandon-pro.github.io/releases">Release notes <span aria-hidden="true">↗</span></a>
+            </div>
+          </div>
+          <div class="doc-list">
+            <details class="doc-item" open>
+              <summary>Open and inspect a binary</summary>
+              <ol><li>Launch <code>GandonPro.exe</code>.</li><li>Choose <strong>File → Open</strong> or press <kbd>Ctrl</kbd> + <kbd>O</kbd>.</li><li>Select an executable or library. The entry function opens in the graph view.</li><li>Use the Functions / Symbols tree to jump to functions, sections, imports and strings.</li></ol>
+            </details>
+            <details class="doc-item">
+              <summary>Navigate the graph and listing</summary>
+              <p>Select a node to change the active address. Use the mouse wheel to zoom and drag to pan. Open the text listing, pseudocode or XREF tab for another view of the current binary. Press <kbd>Home</kbd> to fit the graph.</p>
+            </details>
+            <details class="doc-item">
+              <summary>Build the native application</summary>
+              <p>On Windows, install Visual Studio 2022 with the Desktop development with C++ workload and CMake 3.25 or newer. From a Developer PowerShell in the repository, run:</p>
+              <p><code>cmake --preset windows-msvc-x64</code><br><code>cmake --build --preset windows-msvc-x64-release</code></p>
+            </details>
+            <details class="doc-item">
+              <summary>Debugger shortcuts</summary>
+              <p><kbd>F2</kbd> toggles a breakpoint. <kbd>F9</kbd> starts or continues the process; <kbd>F6</kbd> pauses it. Use <kbd>F7</kbd> to step into and <kbd>F8</kbd> to step over.</p>
+            </details>
+            <details class="doc-item">
+              <summary>Plugins and extensions</summary>
+              <p>Native plugin examples and Python plugins live in the repository's <code>plugins/</code> directory. See the project README and plugin API headers for the supported entry points.</p>
+            </details>
+          </div>
+        </div>
+      </section>
+
+      <section class="release-band" aria-label="Latest releases">
+        <div><div class="eyebrow">Keep exploring</div><h3>Find the latest build and changes.</h3><p>Visit the project releases for downloadable builds, version notes and source archives.</p></div>
+        <a class="button" href="https://github.com/gandon-pro/gandon-pro.github.io/releases">Open GitHub Releases <span aria-hidden="true">↗</span></a>
       </section>
     </div>
   </main>
 
-  <footer><div class="container"><span>© 2026 Gandon-PRO Team</span><a href="#top">Back to top ↑</a></div></footer>
+  <footer><div class="container"><span>© 2026 Gandon-PRO Team</span><div class="footer-links"><a href="https://github.com/gandon-pro/gandon-pro.github.io">GitHub</a><a href="#documentation">Documentation</a><a href="#top">Back to top ↑</a></div></div></footer>
   <script>
+    const root = document.documentElement;
     const menuButton = document.querySelector('.menu-toggle');
     const navbar = document.querySelector('.navbar');
     const themeButton = document.querySelector('.theme-toggle');
-    const savedTheme = localStorage.getItem('gandon-theme');
-    const setThemeButtonState = (dark) => {
-      themeButton.textContent = dark ? '◐ Theme: Dark' : '◐ Theme: Light';
+    const themeLabel = document.querySelector('.theme-label');
+
+    function updateThemeButton() {
+      const dark = root.dataset.theme !== 'light';
+      themeLabel.textContent = dark ? 'Dark' : 'Light';
       themeButton.setAttribute('aria-pressed', String(dark));
-    };
-    if (savedTheme === 'dark') document.documentElement.dataset.theme = 'dark';
-    setThemeButtonState(savedTheme === 'dark');
+      themeButton.setAttribute('aria-label', `Switch to ${dark ? 'light' : 'dark'} theme`);
+      document.querySelector('meta[name="theme-color"]').content = dark ? '#0b0f14' : '#f4f7f8';
+    }
+    updateThemeButton();
     themeButton.addEventListener('click', () => {
-      const dark = document.documentElement.dataset.theme !== 'dark';
-      document.documentElement.dataset.theme = dark ? 'dark' : 'light';
-      localStorage.setItem('gandon-theme', dark ? 'dark' : 'light');
-      setThemeButtonState(dark);
+      root.dataset.theme = root.dataset.theme === 'dark' ? 'light' : 'dark';
+      try { localStorage.setItem('gandon-theme', root.dataset.theme); } catch (_) {}
+      updateThemeButton();
     });
     menuButton.addEventListener('click', () => {
       const open = navbar.classList.toggle('is-open');
       menuButton.setAttribute('aria-expanded', String(open));
+      menuButton.setAttribute('aria-label', open ? 'Close navigation menu' : 'Open navigation menu');
     });
-    document.querySelectorAll('.nav-links a').forEach(link => link.addEventListener('click', () => {
+    document.querySelectorAll('.nav-links a[href^="#"]').forEach(link => link.addEventListener('click', () => {
       navbar.classList.remove('is-open');
       menuButton.setAttribute('aria-expanded', 'false');
     }));
