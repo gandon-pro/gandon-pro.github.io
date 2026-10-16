@@ -1,0 +1,11 @@
+build/
+build-*/
+__pycache__/
+*.py[cod]
+*.gnd
+*.log
+*.dmp
+.vs/
+.vscode/
+.idea/
+cpp/third_party/
