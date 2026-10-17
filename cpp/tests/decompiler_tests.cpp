@@ -30,6 +30,25 @@ gandon::DecompileResult decompile_bytes(const std::uint8_t* bytes, std::size_t s
     return gandon::decompile_function(image, name, address, instructions, options);
 }
 
+gandon::DecompileResult decompile_arm(const std::uint8_t* bytes, std::size_t size, std::uint64_t address,
+                                      const std::string& name) {
+    gandon::BinaryImage image;
+    image.format = gandon::BinaryFormat::ELF;
+    image.architecture = gandon::MachineArchitecture::ARM64;
+    image.is_64_bit = true;
+    image.image_base = 0x400000;
+    image.entry_point = address;
+    const std::uint64_t rva = address - image.image_base;
+    image.bytes.assign(rva + size + 0x100, 0);
+    std::memcpy(image.bytes.data() + rva, bytes, size);
+    image.sections.push_back({".text", static_cast<std::uint64_t>(rva), static_cast<std::uint32_t>(size + 0x100),
+                              static_cast<std::uint32_t>(rva), static_cast<std::uint32_t>(size + 0x100), 0x60000020});
+    const auto instructions = gandon::decode_instructions(image, address, 512);
+    gandon::DecompilerOptions options;
+    options.windows_abi = false;
+    return gandon::decompile_function(image, name, address, instructions, options);
+}
+
 bool contains(const std::string& text, const char* needle) { return text.find(needle) != std::string::npos; }
 
 void fail(const char* test, const std::string& text) {
@@ -89,6 +108,39 @@ void test_pointer_loop() {
     CHECK("strlen_like byte load", contains(r.text, "uint8_t"), r.text);
 }
 
+void test_arm_float_arithmetic() {
+    // scvtf d0, w0 ; scvtf d1, w1 ; fadd d0, d0, d1 ; ret
+    static const std::uint8_t k_arm_fadd[] = {
+        0x00, 0x00, 0x62, 0x1E,
+        0x21, 0x00, 0x62, 0x1E,
+        0x00, 0x28, 0x61, 0x1E,
+        0xC0, 0x03, 0x5F, 0xD6,
+    };
+    const auto r = decompile_arm(k_arm_fadd, sizeof k_arm_fadd, 0x400000, "fadder");
+    CHECK("arm fadd ok", r.ok, r.error);
+    CHECK("arm fadd structured (no opaque __fadd)", !contains(r.text, "__fadd"), r.text);
+    CHECK("arm fadd no opaque scvtf", !contains(r.text, "__scvtf"), r.text);
+    CHECK("arm fadd addition present", contains(r.text, "+"), r.text);
+}
+
+void test_x86_packed_simd_uses_intrinsics() {
+    // xorps xmm0,xmm0 ; addps xmm0,xmm1 ; mulps xmm0,xmm2 ; movups [rdi],xmm0 ; ret
+    static const std::uint8_t k_vec[] = {
+        0x0F, 0x57, 0xC0,
+        0x0F, 0x58, 0xC1,
+        0x0F, 0x59, 0xC2,
+        0x0F, 0x11, 0x07,
+        0xC3,
+    };
+    const auto r = decompile_bytes(k_vec, sizeof k_vec, 0x400000, "vec");
+    CHECK("vec ok", r.ok, r.error);
+    CHECK("vec add intrinsic", contains(r.text, "_mm_add_ps"), r.text);
+    CHECK("vec mul intrinsic", contains(r.text, "_mm_mul_ps"), r.text);
+    CHECK("vec no opaque addps", !contains(r.text, "__addps"), r.text);
+    CHECK("vec no opaque mulps", !contains(r.text, "__mulps"), r.text);
+    CHECK("vec no opaque xorps", !contains(r.text, "__xorps"), r.text);
+}
+
 void test_unsupported_architecture_is_rejected() {
     gandon::BinaryImage image;
     image.architecture = gandon::MachineArchitecture::ARM64;
@@ -105,6 +157,8 @@ int main() {
     test_nested_loop_and_branch_stays_structured();
     test_else_if_chain_flattens_to_early_returns();
     test_pointer_loop();
+    test_arm_float_arithmetic();
+    test_x86_packed_simd_uses_intrinsics();
     test_unsupported_architecture_is_rejected();
     std::puts("decompiler tests passed");
     return 0;

@@ -17,6 +17,7 @@
 #include <windowsx.h>
 #include "gandon/types.hpp"
 #include "gandon/binary_diff.hpp"
+#include "gandon/stack_frame.hpp"
 #include <richedit.h>
 #include <memory>
 #include <sstream>
@@ -57,7 +58,7 @@ constexpr int ID_PYTHON_PLUGIN_FIRST = 1700;
 constexpr int ID_SAVE_DB = 1301, ID_LOAD_DB = 1302, ID_APPLY_PATCHES = 1303, ID_EXPORT_GRAPH = 1304;
 constexpr int ID_RENAME_LABEL = 1310, ID_ADD_COMMENT = 1311, ID_NOP_BLOCK = 1312, ID_EDIT_INSTRUCTION = 1313, ID_UNDO_PATCH = 1314, ID_REDO_PATCH = 1315, ID_ASSIGN_TYPE = 1316;
 constexpr int ID_DECOMPILE = 1320, ID_SIGMAKER = 1321, ID_SEARCH_SIGNATURE = 1322, ID_CALL_GRAPH = 1323, ID_MEMORY_VIEW = 1324, ID_WATCH_LOCALS = 1325, ID_CALL_STACK = 1326, ID_COMPARE = 1327, ID_PY_CONSOLE = 1328, ID_SEARCH = 1329;
-constexpr int ID_JUMP_BACK = 1330, ID_TOGGLE_BOOKMARK = 1331, ID_NEXT_BOOKMARK = 1332, ID_EXPORT_JSON = 1333, ID_EXPORT_BREAKPOINTS = 1334, ID_EXPORT_DEBUG_LOG = 1335, ID_JUMP_ADDR = 1336;
+constexpr int ID_JUMP_BACK = 1330, ID_TOGGLE_BOOKMARK = 1331, ID_NEXT_BOOKMARK = 1332, ID_EXPORT_JSON = 1333, ID_EXPORT_BREAKPOINTS = 1334, ID_EXPORT_DEBUG_LOG = 1335, ID_JUMP_ADDR = 1336, ID_JUMP_FORWARD = 1359;
 constexpr int ID_LIST_XREFS = 1336, ID_SEARCH_PROCESS_MEMORY = 1337, ID_FIND_FUNCTION = 1338, ID_HIDE_FUNCTION = 1339;
 constexpr int ID_RUN = 1340, ID_STEP_INTO = 1341, ID_STEP_OVER = 1342, ID_TOGGLE_BP = 1343, ID_COND_BP = 1344, ID_CONFIG_BP = 1345, ID_BP_MANAGER = 1346, ID_HW_BP = 1347, ID_DELETE_BP = 1348, ID_STOP = 1349;
 constexpr int ID_ANTI_DEBUG = 1350;
@@ -65,7 +66,7 @@ constexpr int ID_TRACE_TOGGLE = 1351, ID_EXPORT_TRACE = 1352, ID_HIDDEN_SYMBOLS 
 constexpr int ID_HIDE_IMPORT = 1355;
 constexpr int ID_MEMORY_SNAPSHOT = 1356, ID_MEMORY_COMPARE = 1357;
 constexpr int ID_PAUSE = 1358;
-constexpr int ID_VIEW_GRAPH = 1360, ID_VIEW_LISTING = 1361, ID_VIEW_PSEUDO = 1362, ID_VIEW_DEBUGGER = 1363, ID_VIEW_HEX = 1364, ID_VIEW_TYPES = 1365, ID_VIEW_IMPORTS = 1366, ID_VIEW_EXPORTS = 1367, ID_VIEW_STRINGS = 1368, ID_VIEW_RESOURCES = 1369, ID_VIEW_SYMBOLS = 1370, ID_VIEW_MEMORY = 1371, ID_VIEW_PROBLEMS = 1372, ID_ABOUT = 1380;
+constexpr int ID_VIEW_GRAPH = 1360, ID_VIEW_LISTING = 1361, ID_VIEW_PSEUDO = 1362, ID_VIEW_DEBUGGER = 1363, ID_VIEW_HEX = 1364, ID_VIEW_TYPES = 1365, ID_VIEW_IMPORTS = 1366, ID_VIEW_EXPORTS = 1367, ID_VIEW_STRINGS = 1368, ID_VIEW_RESOURCES = 1369, ID_VIEW_SYMBOLS = 1370, ID_VIEW_MEMORY = 1371, ID_VIEW_PROBLEMS = 1372, ID_GRAPH_COLLAPSE = 1373, ID_GRAPH_EXPAND_ALL = 1374, ID_ABOUT = 1380;
 constexpr int ID_TOGGLE_GRAPH_LIST = 1373, ID_FIT_GRAPH = 1374, ID_TOGGLE_MINIMAP = 1375;
 constexpr int ID_PATHFINDER = 1376;
 constexpr int ID_EMULATE = 1377, ID_EMULATE_STEP = 1378, ID_EMULATE_RESET = 1379;
@@ -83,6 +84,7 @@ constexpr int ID_STRUCT_OFFSET = 1406, ID_ENUM_OPERAND = 1407, ID_SET_PROTOTYPE 
 constexpr int ID_VIEW_LLIL = 1398, ID_LLIL_LIFT = 1399, ID_LLIL_STEP = 1400, ID_LLIL_RUN = 1401;
 constexpr int ID_LLIL_SET_REGISTER = 1402, ID_LLIL_RESET = 1403;
 constexpr int ID_LLIL_WRITE_MEMORY = 1404;
+constexpr int ID_GRAPH_GROUP = 1411, ID_GRAPH_UNGROUP = 1412, ID_GRAPH_CLEAR_SELECTION = 1413;
 constexpr int ID_CONTEXT_FOLLOW = 1390, ID_CONTEXT_COPY = 1391, ID_CONTEXT_FOLLOW_TARGET = 1392;
 constexpr int ID_COLOR_DEFAULT = 1393, ID_COLOR_GREEN = 1394, ID_COLOR_RED = 1395, ID_COLOR_BLUE = 1396;
 constexpr int GRAPH_PAN_PADDING = 100000;
@@ -143,6 +145,8 @@ struct GraphBlock {
     std::uint64_t start{};
     std::vector<const gandon::Instruction*> instructions;
     int x{}, y{}, width{520}, height{100};
+    bool is_group{};                // folded user-defined group of several blocks
+    std::size_t group_members{};    // how many original blocks it stands for
 };
 enum class GraphEdgeKind { Unconditional, TrueBranch, FalseBranch };
 struct GraphEdge { std::uint64_t from{}, to{}; GraphEdgeKind kind{GraphEdgeKind::Unconditional}; };
@@ -158,6 +162,9 @@ struct InstalledImportDisable {
 };
 std::vector<GraphBlock> g_graph_blocks;
 std::vector<GraphEdge> g_graph_edges;
+std::set<std::uint64_t> g_collapsed_blocks;   // graph nodes drawn as a one-line header
+std::vector<std::vector<std::uint64_t>> g_graph_groups;  // each: member block-starts folded into one node
+std::set<std::uint64_t> g_graph_selection;    // block-starts tagged for the next "Group" (session-only)
 std::vector<gandon::Instruction> g_graph_fallback_instructions;
 std::unordered_map<std::uint64_t, std::pair<int, int>> g_graph_positions;
 std::set<std::uint64_t> g_string_addresses;
@@ -208,7 +215,8 @@ void ensure_types(bool is_64_bit) {
 }
 std::unordered_map<std::uint64_t, COLORREF> g_graph_colors;
 struct NavigationPoint { std::uint64_t address{}; int tab{}; };
-std::vector<NavigationPoint> g_navigation_history;
+std::vector<NavigationPoint> g_navigation_history;   // back stack
+std::vector<NavigationPoint> g_navigation_forward;   // forward stack (after Jump Back)
 std::set<std::uint64_t> g_bookmarks;
 std::set<std::uint64_t> g_hidden_functions;
 std::set<std::pair<std::wstring, std::wstring>> g_hidden_imports;
@@ -774,8 +782,11 @@ void rebuild_graph_model() {
     GraphBlock block;
     const auto finish_block = [&]() {
         if (block.instructions.empty()) return;
-        block.height = 44 + static_cast<int>((std::min<std::size_t>)(block.instructions.size(), 40)) * 18 +
-                       (g_custom_comments.contains(block.start) ? 18 : 0);
+        if (g_collapsed_blocks.contains(block.start))
+            block.height = 44;   // header only
+        else
+            block.height = 44 + static_cast<int>((std::min<std::size_t>)(block.instructions.size(), 40)) * 18 +
+                           (g_custom_comments.contains(block.start) ? 18 : 0);
         g_graph_blocks.push_back(std::move(block));
         block = GraphBlock{};
     };
@@ -819,6 +830,52 @@ void rebuild_graph_model() {
     g_graph_edges.erase(std::unique(g_graph_edges.begin(), g_graph_edges.end(), [](const GraphEdge& left, const GraphEdge& right) {
         return left.from == right.from && left.to == right.to && left.kind == right.kind;
     }), g_graph_edges.end());
+
+    // Fold user-defined groups: every member block collapses into one node drawn
+    // at the group's anchor (its lowest-address member). Edges touching a member
+    // are rerouted to the anchor and edges wholly inside the group are dropped, so
+    // the CFG stays well-formed and the level/row layout treats the group as one.
+    if (!g_graph_groups.empty() && !g_graph_blocks.empty()) {
+        std::set<std::uint64_t> present;
+        for (const auto& b : g_graph_blocks) present.insert(b.start);
+        std::unordered_map<std::uint64_t, std::uint64_t> remap;   // member -> anchor
+        std::map<std::uint64_t, std::size_t> member_count;        // anchor -> members folded
+        for (const auto& group : g_graph_groups) {
+            std::vector<std::uint64_t> members;
+            for (const auto m : group) if (present.contains(m)) members.push_back(m);
+            if (members.size() < 2) continue;                     // nothing to fold this function
+            const std::uint64_t anchor = *std::min_element(members.begin(), members.end());
+            for (const auto m : members) remap[m] = anchor;
+            member_count[anchor] = members.size();
+        }
+        if (!remap.empty()) {
+            std::vector<GraphBlock> kept;
+            kept.reserve(g_graph_blocks.size());
+            for (auto& b : g_graph_blocks) {
+                const auto it = remap.find(b.start);
+                if (it == remap.end()) { kept.push_back(std::move(b)); continue; }
+                if (it->second != b.start) continue;              // non-anchor member: drop
+                b.is_group = true;
+                b.group_members = member_count[b.start];
+                b.instructions.clear();
+                b.height = 44;                                    // header-only, like a collapsed node
+                kept.push_back(std::move(b));
+            }
+            g_graph_blocks = std::move(kept);
+            for (auto& e : g_graph_edges) {
+                if (const auto it = remap.find(e.from); it != remap.end()) e.from = it->second;
+                if (const auto it = remap.find(e.to); it != remap.end()) e.to = it->second;
+            }
+            g_graph_edges.erase(std::remove_if(g_graph_edges.begin(), g_graph_edges.end(),
+                [](const GraphEdge& e) { return e.from == e.to; }), g_graph_edges.end());
+            std::sort(g_graph_edges.begin(), g_graph_edges.end(), [](const GraphEdge& left, const GraphEdge& right) {
+                return std::tie(left.from, left.to, left.kind) < std::tie(right.from, right.to, right.kind);
+            });
+            g_graph_edges.erase(std::unique(g_graph_edges.begin(), g_graph_edges.end(), [](const GraphEdge& left, const GraphEdge& right) {
+                return left.from == right.from && left.to == right.to && left.kind == right.kind;
+            }), g_graph_edges.end());
+        }
+    }
 
     // Assign each block once using a breadth-first traversal. Repeatedly
     // relaxing levels makes every loop/back-edge increase its own level and
@@ -1317,6 +1374,91 @@ LRESULT CALLBACK minimap_proc(HWND window, UINT message, WPARAM wparam, LPARAM l
     return DefWindowProcW(window, message, wparam, lparam);
 }
 
+std::uint64_t graph_block_start_containing(std::uint64_t address) {
+    for (const auto& b : g_graph_blocks) {
+        if (b.instructions.empty()) continue;
+        const auto lo = b.instructions.front()->address;
+        const auto hi = b.instructions.back()->address + b.instructions.back()->size;
+        if (address >= lo && address < hi) return b.start;
+    }
+    return 0;
+}
+
+void refresh_graph_after_collapse() {
+    rebuild_graph_model();
+    if (g_view) { update_graph_scrollbars(g_view); InvalidateRect(g_view, nullptr, FALSE); }
+    invalidate_minimap();
+}
+
+void toggle_block_collapse(std::uint64_t address) {
+    const auto start = graph_block_start_containing(address);
+    if (!start) return;
+    if (g_collapsed_blocks.contains(start)) g_collapsed_blocks.erase(start);
+    else g_collapsed_blocks.insert(start);
+    g_session_dirty = true;
+    refresh_graph_after_collapse();
+}
+
+void expand_all_blocks() {
+    if (g_collapsed_blocks.empty()) return;
+    g_collapsed_blocks.clear();
+    g_session_dirty = true;
+    refresh_graph_after_collapse();
+}
+
+// Index of the group whose member list contains `address` (a block start), or -1.
+int graph_group_index_for(std::uint64_t address) {
+    for (std::size_t i = 0; i < g_graph_groups.size(); ++i)
+        if (std::find(g_graph_groups[i].begin(), g_graph_groups[i].end(), address) != g_graph_groups[i].end())
+            return static_cast<int>(i);
+    return -1;
+}
+
+bool address_in_any_group(std::uint64_t address) { return graph_group_index_for(address) >= 0; }
+
+void toggle_graph_selection(std::uint64_t block_start) {
+    if (!block_start) return;
+    if (g_graph_selection.contains(block_start)) g_graph_selection.erase(block_start);
+    else g_graph_selection.insert(block_start);
+    if (g_view) InvalidateRect(g_view, nullptr, FALSE);
+    invalidate_minimap();
+}
+
+void clear_graph_selection() {
+    if (g_graph_selection.empty()) return;
+    g_graph_selection.clear();
+    if (g_view) InvalidateRect(g_view, nullptr, FALSE);
+    invalidate_minimap();
+}
+
+// Fold the current selection into a new group. Members already belonging to an
+// existing group are skipped so member sets never overlap.
+void group_selected_nodes() {
+    std::vector<std::uint64_t> members;
+    for (const auto s : g_graph_selection) if (!address_in_any_group(s)) members.push_back(s);
+    g_graph_selection.clear();
+    if (members.size() < 2) { if (g_view) InvalidateRect(g_view, nullptr, FALSE); invalidate_minimap(); return; }
+    g_graph_groups.push_back(std::move(members));
+    g_session_dirty = true;
+    refresh_graph_after_collapse();
+}
+
+// Dissolve the group that owns `address` (its anchor or any member).
+bool ungroup_at(std::uint64_t address) {
+    const int gi = graph_group_index_for(address);
+    if (gi < 0) return false;
+    g_graph_groups.erase(g_graph_groups.begin() + gi);
+    g_session_dirty = true;
+    refresh_graph_after_collapse();
+    return true;
+}
+
+// Double-click on a node: a group dissolves, anything else collapses/expands.
+void graph_handle_double_click(std::uint64_t address) {
+    if (ungroup_at(address)) return;
+    toggle_block_collapse(address);
+}
+
 void show_graph_context_menu(HWND graph, int client_x, int client_y) {
     const auto address = graph_address_at(client_x, client_y);
     if (!address || !g_database) return;
@@ -1335,6 +1477,20 @@ void show_graph_context_menu(HWND graph, int client_x, int client_y) {
     AppendMenuW(context, MF_STRING, ID_ADD_COMMENT, L"Add Comment");
     AppendMenuW(context, MF_STRING, ID_ASSIGN_TYPE, L"Assign Type...");
     AppendMenuW(context, MF_STRING, ID_HIDE_FUNCTION, L"Hide Function from Analysis");
+    AppendMenuW(context, MF_SEPARATOR, 0, nullptr);
+    {
+        const auto start = graph_block_start_containing(*address);
+        const bool collapsed = start && g_collapsed_blocks.contains(start);
+        AppendMenuW(context, MF_STRING, ID_GRAPH_COLLAPSE, collapsed ? L"Expand Node\tDbl-click" : L"Collapse Node\tDbl-click");
+        AppendMenuW(context, MF_STRING | (g_collapsed_blocks.empty() ? MF_GRAYED : 0), ID_GRAPH_EXPAND_ALL, L"Expand All Nodes");
+        AppendMenuW(context, MF_SEPARATOR, 0, nullptr);
+        std::size_t selectable = 0;
+        for (const auto s : g_graph_selection) if (!address_in_any_group(s)) ++selectable;
+        std::wstring group_text = L"Group Selected Nodes (" + std::to_wstring(selectable) + L")\tCtrl+click";
+        AppendMenuW(context, MF_STRING | (selectable >= 2 ? 0 : MF_GRAYED), ID_GRAPH_GROUP, group_text.c_str());
+        AppendMenuW(context, MF_STRING | (graph_group_index_for(*address) >= 0 ? 0 : MF_GRAYED), ID_GRAPH_UNGROUP, L"Ungroup\tDbl-click");
+        AppendMenuW(context, MF_STRING | (g_graph_selection.empty() ? MF_GRAYED : 0), ID_GRAPH_CLEAR_SELECTION, L"Clear Selection");
+    }
     HMENU colors = CreatePopupMenu();
     AppendMenuW(colors, MF_STRING, ID_COLOR_DEFAULT, L"Default Dark");
     AppendMenuW(colors, MF_STRING, ID_COLOR_GREEN, L"Success / True (Green)");
@@ -1355,6 +1511,12 @@ LRESULT CALLBACK graph_proc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         InvalidateRect(window, nullptr, FALSE);
         invalidate_minimap();
         return 0;
+    }
+    if (message == WM_LBUTTONDBLCLK) {
+        if (const auto address = graph_address_at(static_cast<short>(LOWORD(lparam)), static_cast<short>(HIWORD(lparam)))) {
+            graph_handle_double_click(*address);
+            return 0;
+        }
     }
     if (message == WM_HSCROLL) {
         scroll_graph(window, SB_HORZ, LOWORD(wparam), HIWORD(wparam));
@@ -1411,6 +1573,11 @@ LRESULT CALLBACK graph_proc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
     if (message == WM_LBUTTONDOWN && g_database) {
         const int x = static_cast<int>(static_cast<short>(LOWORD(lparam)));
         const int y = static_cast<int>(static_cast<short>(HIWORD(lparam)));
+        // Ctrl+click tags a node for grouping instead of starting a drag.
+        if (GetKeyState(VK_CONTROL) < 0) {
+            if (const auto* block = graph_block_at(x, y)) toggle_graph_selection(block->start);
+            return 0;
+        }
         if (const auto* block = graph_block_at(x, y)) {
             g_graph_dragging = true;
             g_graph_drag_moved = false;
@@ -1524,13 +1691,23 @@ LRESULT CALLBACK graph_proc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
                 const int width = static_cast<int>(block.width * scale), height = static_cast<int>(block.height * scale);
                 RECT box{x, y, x + width, y + height};
                 const bool active_block = block.start == g_current_address || std::any_of(block.instructions.begin(), block.instructions.end(), [](const auto* instruction) { return instruction->address == g_current_address; });
+                const bool selected = g_graph_selection.contains(block.start);
                 COLORREF block_color = active_block ? THEMED_RGB(36, 57, 66) : THEMED_RGB(32, 39, 47);
+                if (block.is_group) block_color = active_block ? THEMED_RGB(48, 44, 66) : THEMED_RGB(40, 37, 56);  // group tint
                 if (const auto color = g_graph_colors.find(block.start); color != g_graph_colors.end()) block_color = color->second;
                 HBRUSH fill = CreateSolidBrush(block_color);
                 FillRect(dc, &box, fill); DeleteObject(fill);
                 HPEN border = CreatePen(PS_SOLID, active_block ? 2 : 1, active_block ? THEMED_RGB(0, 160, 210) : THEMED_RGB(62, 78, 91));
                 HGDIOBJ old_pen = SelectObject(dc, border); HGDIOBJ old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-                Rectangle(dc, box.left, box.top, box.right, box.bottom); SelectObject(dc, old_brush); SelectObject(dc, old_pen); DeleteObject(border);
+                Rectangle(dc, box.left, box.top, box.right, box.bottom); SelectObject(dc, old_pen); DeleteObject(border);
+                if (selected) {   // amber outline around nodes tagged for grouping
+                    const int inset = (std::max)(2, static_cast<int>(std::lround(2 * scale)));
+                    HPEN mark = CreatePen(PS_SOLID, (std::max)(2, static_cast<int>(std::lround(3 * scale))), THEMED_RGB(230, 190, 70));
+                    HGDIOBJ old_mark = SelectObject(dc, mark);
+                    Rectangle(dc, box.left + inset, box.top + inset, box.right - inset, box.bottom - inset);
+                    SelectObject(dc, old_mark); DeleteObject(mark);
+                }
+                SelectObject(dc, old_brush);
                 // Block geometry is zoomed in world coordinates.  Use a
                 // matching font and scaled padding as well; otherwise Fit
                 // Graph shrinks the boxes while leaving the text at 100%,
@@ -1542,24 +1719,39 @@ LRESULT CALLBACK graph_proc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
                 HGDIOBJ old_block_font = scaled_font ? SelectObject(dc, scaled_font) : nullptr;
                 const auto sx = [scale](int value) { return (std::max)(1, static_cast<int>(std::lround(value * scale))); };
                 std::wstring title;
-                if (g_custom_labels.contains(block.start)) title = g_custom_labels[block.start];
+                if (block.is_group && !g_custom_labels.contains(block.start)) {
+                    std::wostringstream value; value << L"⊞ group_" << std::hex << std::uppercase << block.start; title = value.str();
+                } else if (g_custom_labels.contains(block.start)) title = g_custom_labels[block.start];
                 else {
                     const auto known = ida_views(*g_database).name_at(block.start);
                     if (!known.empty()) title = wide(known);
                     else { std::wostringstream value; value << L"loc_" << std::hex << std::uppercase << block.start; title = value.str(); }
                 }
                 title += L":";
-                SetTextColor(dc, THEMED_RGB(170, 239, 207)); TextOutW(dc, x + sx(12), y + sx(8), title.c_str(), static_cast<int>(title.size()));
+                const bool collapsed = g_collapsed_blocks.contains(block.start) || block.is_group;
+                // [-]/[+] toggle glyph at the right edge of the header.
+                const std::wstring glyph = collapsed ? L"[+]" : L"[-]";
+                SetTextColor(dc, THEMED_RGB(155, 170, 184)); TextOutW(dc, x + width - sx(34), y + sx(8), glyph.c_str(), 3);
+                SetTextColor(dc, block.is_group ? THEMED_RGB(206, 184, 247) : THEMED_RGB(170, 239, 207)); TextOutW(dc, x + sx(12), y + sx(8), title.c_str(), static_cast<int>(title.size()));
                 HPEN separator = CreatePen(PS_SOLID, 1, THEMED_RGB(52, 64, 74));
                 HGDIOBJ old_separator = SelectObject(dc, separator);
                 MoveToEx(dc, x + 1, y + sx(27), nullptr); LineTo(dc, x + width - 1, y + sx(27));
                 SelectObject(dc, old_separator); DeleteObject(separator);
                 int line_y = y + sx(30);
-                if (g_custom_comments.contains(block.start)) {
+                if (block.is_group) {
+                    std::wostringstream summary; summary << L"▣ group of " << block.group_members << L" blocks (double-click to ungroup)";
+                    const auto text = summary.str();
+                    SetTextColor(dc, THEMED_RGB(206, 184, 247)); TextOutW(dc, x + sx(12), line_y, text.c_str(), static_cast<int>(text.size()));
+                } else if (collapsed) {
+                    std::wostringstream summary; summary << L"▸ " << block.instructions.size() << L" instruction" << (block.instructions.size() == 1 ? L"" : L"s") << L" (double-click to expand)";
+                    const auto text = summary.str();
+                    SetTextColor(dc, THEMED_RGB(155, 170, 184)); TextOutW(dc, x + sx(12), line_y, text.c_str(), static_cast<int>(text.size()));
+                }
+                if (g_custom_comments.contains(block.start) && !collapsed) {
                     const auto comment = L"// " + g_custom_comments[block.start];
                     SetTextColor(dc, THEMED_RGB(155, 170, 184)); TextOutW(dc, x + sx(12), line_y, comment.c_str(), static_cast<int>(comment.size())); line_y += sx(18);
                 }
-                for (std::size_t index = 0; index < block.instructions.size() && index < 40; ++index) {
+                for (std::size_t index = 0; index < block.instructions.size() && index < 40 && !collapsed; ++index) {
                     const auto& instruction = *block.instructions[index];
                     const auto& views = ida_views(*g_database);
                     const auto address = wide(views.address_text(instruction.address));
@@ -2576,6 +2768,7 @@ void navigate_to_address(HWND window, std::uint64_t address, int tab) {
     if (g_current_address && g_current_address != address) {
         g_navigation_history.push_back({g_current_address, g_tabs ? TabCtrl_GetCurSel(g_tabs) : 1});
         if (g_navigation_history.size() > 256) g_navigation_history.erase(g_navigation_history.begin());
+        g_navigation_forward.clear();   // a fresh jump invalidates the forward trail
     }
     g_current_address = address;
     g_session_dirty = true;
@@ -2743,6 +2936,15 @@ void restore_all_hidden_symbols(HWND) {
     SetWindowTextW(g_status, L"All hidden functions restored.");
 }
 
+void jump_to_point(HWND window, const NavigationPoint& point) {
+    g_current_address = point.address;
+    g_session_dirty = true;
+    if (g_navband) InvalidateRect(g_navband, nullptr, FALSE);
+    if (point.tab == 2) g_pseudocode = pseudocode_text_at(*g_database, point.address);
+    else if (point.tab == 1) g_listing = listing_text_at(*g_database, point.address);
+    select_view(window, point.tab);
+}
+
 void jump_back(HWND window) {
     if (!g_database || g_navigation_history.empty()) {
         SetWindowTextW(g_status, L"Navigation history is empty.");
@@ -2750,12 +2952,19 @@ void jump_back(HWND window) {
     }
     const auto point = g_navigation_history.back();
     g_navigation_history.pop_back();
-    g_current_address = point.address;
-    g_session_dirty = true;
-    if (g_navband) InvalidateRect(g_navband, nullptr, FALSE);
-    if (point.tab == 2) g_pseudocode = pseudocode_text_at(*g_database, point.address);
-    else if (point.tab == 1) g_listing = listing_text_at(*g_database, point.address);
-    select_view(window, point.tab);
+    if (g_current_address) g_navigation_forward.push_back({g_current_address, g_tabs ? TabCtrl_GetCurSel(g_tabs) : 1});
+    jump_to_point(window, point);
+}
+
+void jump_forward(HWND window) {
+    if (!g_database || g_navigation_forward.empty()) {
+        SetWindowTextW(g_status, L"Nothing to jump forward to.");
+        return;
+    }
+    const auto point = g_navigation_forward.back();
+    g_navigation_forward.pop_back();
+    if (g_current_address) g_navigation_history.push_back({g_current_address, g_tabs ? TabCtrl_GetCurSel(g_tabs) : 1});
+    jump_to_point(window, point);
 }
 
 void toggle_bookmark(HWND window) {
@@ -3368,6 +3577,10 @@ void release_analysis_state_for_replacement() {
     decltype(g_requested_disabled_imports)().swap(g_requested_disabled_imports);
     decltype(g_installed_import_disables)().swap(g_installed_import_disables);
     std::vector<NavigationPoint>().swap(g_navigation_history);
+    std::vector<NavigationPoint>().swap(g_navigation_forward);
+    g_collapsed_blocks.clear();
+    g_graph_groups.clear();
+    g_graph_selection.clear();
     std::vector<std::wstring>().swap(g_watch_expressions);
     g_bookmarks.clear(); g_hidden_functions.clear(); g_hidden_imports.clear();
     { std::lock_guard lock(g_breakpoint_mutex);
@@ -3553,6 +3766,12 @@ bool write_database_file(const std::filesystem::path& file, std::string& error) 
     for (const auto& [address, position] : g_graph_positions) output << L"V|" << address << L"|" << position.first << L"," << position.second << L"\n";
     output << L"G|" << std::dec << g_graph_zoom << L"|graph_zoom\n";
     output << L"H|" << g_graph_scroll_x << L"," << g_graph_scroll_y << L"|graph_scroll\n";
+    for (const auto& group : g_graph_groups) {
+        if (group.size() < 2) continue;
+        output << L"M|0|" << std::dec;
+        for (std::size_t i = 0; i < group.size(); ++i) output << (i ? L"," : L"") << group[i];
+        output << L"\n";
+    }
     // Persist the effective byte values, not only the undo stack metadata.
     // A database is reopened from the original binary, so these records are
     // what makes patches survive a close/load cycle.
@@ -3777,6 +3996,20 @@ bool load_database_core(HWND window, const std::filesystem::path& file_name, boo
                     }
                 }
             }
+            continue;
+        }
+        if (record[0] == L'M') {   // graph node group: comma-separated member block-starts
+            std::vector<std::uint64_t> members;
+            const auto list = record.substr(split + 1);
+            std::size_t pos = 0;
+            while (pos < list.size()) {
+                const auto comma = list.find(L',', pos);
+                const auto token = list.substr(pos, comma == std::wstring::npos ? std::wstring::npos : comma - pos);
+                try { if (!token.empty()) members.push_back(std::stoull(token)); } catch (...) {}
+                if (comma == std::wstring::npos) break;
+                pos = comma + 1;
+            }
+            if (members.size() >= 2) g_graph_groups.push_back(std::move(members));
             continue;
         }
         try {
@@ -5823,9 +6056,14 @@ void dark_title_bar(HWND hwnd) {
 
 namespace funcwin {
 HWND window{}, list{}, filter{};
-struct Row { std::uint64_t start{}; std::wstring name; std::uint64_t size{}; std::size_t xrefs{}, calls{}, instructions{}; };
+struct Row { std::uint64_t start{}; std::wstring name; std::uint64_t size{}; std::size_t xrefs{}, calls{}, instructions{}; std::uint64_t locals{}; int args{}; };
 std::vector<Row> all_rows, shown;
 int sort_column = 1; bool sort_descending = false;
+
+// Cache of (frame alloc, argument count) per function, rebuilt when the
+// database changes, so the Functions list stays responsive on large binaries.
+std::unordered_map<std::uint64_t, std::pair<std::uint64_t, int>> frame_cache;
+std::wstring frame_cache_stamp;
 std::wstring last_stamp;
 constexpr UINT_PTR TIMER_REFRESH = 5;
 
@@ -5841,6 +6079,10 @@ std::wstring hex_text(std::uint64_t value) { wchar_t b[24]{}; swprintf_s(b, L"%l
 void rebuild() {
     all_rows.clear(); shown.clear();
     if (g_database) {
+        const auto stamp = database_stamp();
+        if (stamp != frame_cache_stamp) { frame_cache.clear(); frame_cache_stamp = stamp; }
+        const bool arm64 = g_database->image().architecture == gandon::MachineArchitecture::ARM64;
+        const bool win = g_database->image().format == gandon::BinaryFormat::PE;
         std::unordered_map<std::uint64_t, std::size_t> incoming;
         for (const auto& xref : g_database->xrefs()) ++incoming[xref.to];
         for (const auto& function : g_database->functions()) {
@@ -5852,6 +6094,14 @@ void rebuild() {
             row.size = end > function.start ? end - function.start : 0;
             row.xrefs = incoming.contains(function.start) ? incoming[function.start] : 0;
             row.calls = function.callees.size(); row.instructions = function.instructions.size();
+            auto cached = frame_cache.find(function.start);
+            if (cached == frame_cache.end()) {
+                const auto frame = gandon::analyze_stack_frame(function, g_database->image().is_64_bit, arm64, win);
+                int total_args = frame.reg_args;
+                for (const auto& v : frame.vars) if (v.is_arg && !(win && !arm64 && v.offset >= 0 && v.offset < 0x20)) ++total_args;
+                cached = frame_cache.emplace(function.start, std::make_pair(frame.alloc, total_args)).first;
+            }
+            row.locals = cached->second.first; row.args = cached->second.second;
             all_rows.push_back(std::move(row));
         }
     }
@@ -5870,9 +6120,11 @@ void rebuild() {
             switch (sort_column) {
             case 0: return _wcsicmp(a.name.c_str(), b.name.c_str()) < 0;
             case 2: return a.size < b.size;
-            case 3: return a.xrefs < b.xrefs;
-            case 4: return a.calls < b.calls;
-            case 5: return a.instructions < b.instructions;
+            case 3: return a.locals < b.locals;
+            case 4: return a.args < b.args;
+            case 5: return a.xrefs < b.xrefs;
+            case 6: return a.calls < b.calls;
+            case 7: return a.instructions < b.instructions;
             default: return a.start < b.start;
             }
         };
@@ -5880,9 +6132,11 @@ void rebuild() {
             switch (sort_column) {
             case 0: return _wcsicmp(a.name.c_str(), b.name.c_str()) > 0;
             case 2: return a.size > b.size;
-            case 3: return a.xrefs > b.xrefs;
-            case 4: return a.calls > b.calls;
-            case 5: return a.instructions > b.instructions;
+            case 3: return a.locals > b.locals;
+            case 4: return a.args > b.args;
+            case 5: return a.xrefs > b.xrefs;
+            case 6: return a.calls > b.calls;
+            case 7: return a.instructions > b.instructions;
             default: return a.start > b.start;
             }
         };
@@ -5938,9 +6192,9 @@ LRESULT CALLBACK proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
             using Fn = HRESULT(WINAPI*)(HWND, LPCWSTR, LPCWSTR);
             if (const auto set_theme = reinterpret_cast<Fn>(reinterpret_cast<void*>(GetProcAddress(uxtheme, "SetWindowTheme")))) { set_theme(list, L"DarkMode_ItemsView", nullptr);  set_theme(filter, L"DarkMode_CFD", nullptr); }
         }
-        const wchar_t* names[] = {L"Function name", L"Address", L"Size", L"Xrefs", L"Calls", L"Instr."};
-        const int widths[] = {300, 150, 80, 70, 70, 70};
-        for (int i = 0; i < 6; ++i) { LVCOLUMNW column{}; column.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT; column.pszText = const_cast<wchar_t*>(names[i]); column.cx = widths[i]; column.fmt = i >= 2 ? LVCFMT_RIGHT : LVCFMT_LEFT; ListView_InsertColumn(list, i, &column); }
+        const wchar_t* names[] = {L"Function name", L"Address", L"Size", L"Locals", L"Args", L"Xrefs", L"Calls", L"Instr."};
+        const int widths[] = {300, 150, 80, 70, 60, 70, 70, 70};
+        for (int i = 0; i < 8; ++i) { LVCOLUMNW column{}; column.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT; column.pszText = const_cast<wchar_t*>(names[i]); column.cx = widths[i]; column.fmt = i >= 2 ? LVCFMT_RIGHT : LVCFMT_LEFT; ListView_InsertColumn(list, i, &column); }
         if (!g_light_theme) if (const auto header = ListView_GetHeader(list)) SetWindowSubclass(header, header_proc, 1, 0);
         SetTimer(hwnd, TIMER_REFRESH, 800, nullptr);
         return 0;
@@ -5970,8 +6224,10 @@ LRESULT CALLBACK proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
                     case 0: text = row.name; break;
                     case 1: text = hex_text(row.start); break;
                     case 2: text = std::to_wstring(row.size); break;
-                    case 3: text = std::to_wstring(row.xrefs); break;
-                    case 4: text = std::to_wstring(row.calls); break;
+                    case 3: text = row.locals ? hex_text(row.locals) : L""; break;
+                    case 4: text = row.args ? std::to_wstring(row.args) : L""; break;
+                    case 5: text = std::to_wstring(row.xrefs); break;
+                    case 6: text = std::to_wstring(row.calls); break;
                     default: text = std::to_wstring(row.instructions); break;
                     }
                     info->item.pszText = text.data();
@@ -7871,7 +8127,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         AppendMenuW(edit, MF_STRING, ID_UNDO_PATCH, L"Undo Patch\tCtrl+Z"); AppendMenuW(edit, MF_STRING, ID_REDO_PATCH, L"Redo Patch\tCtrl+Y");
         HMENU jump = CreatePopupMenu();
         AppendMenuW(jump, MF_STRING, ID_JUMP_ADDR, L"Jump to Address / Label...\tCtrl+G");
-        AppendMenuW(jump, MF_STRING, ID_JUMP_BACK, L"Jump Back");
+        AppendMenuW(jump, MF_STRING, ID_JUMP_BACK, L"Jump Back\tEsc");
+        AppendMenuW(jump, MF_STRING, ID_JUMP_FORWARD, L"Jump Forward\tCtrl+Enter");
         AppendMenuW(jump, MF_STRING, ID_TOGGLE_BOOKMARK, L"Toggle Bookmark");
         AppendMenuW(jump, MF_STRING, ID_NEXT_BOOKMARK, L"Next Bookmark");
         AppendMenuW(jump, MF_STRING, ID_LIST_XREFS, L"List XREFs");
@@ -8032,8 +8289,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
                 {0, ID_OPEN, TBSTATE_ENABLED, BTNS_BUTTON, {}, 0, reinterpret_cast<INT_PTR>(L"Open")},
                 {1, ID_SAVE_DB, TBSTATE_ENABLED, BTNS_BUTTON, {}, 0, reinterpret_cast<INT_PTR>(L"Save database")},
                 {0, 0, TBSTATE_ENABLED, BTNS_SEP, {}, 0, 0},
-                {2, ID_JUMP_BACK, TBSTATE_ENABLED, BTNS_BUTTON, {}, 0, reinterpret_cast<INT_PTR>(L"Jump back")},
-                {3, ID_REDO_PATCH, TBSTATE_ENABLED, BTNS_BUTTON, {}, 0, reinterpret_cast<INT_PTR>(L"Redo patch")},
+                {2, ID_JUMP_BACK, TBSTATE_ENABLED, BTNS_BUTTON, {}, 0, reinterpret_cast<INT_PTR>(L"Jump back (Esc)")},
+                {3, ID_JUMP_FORWARD, TBSTATE_ENABLED, BTNS_BUTTON, {}, 0, reinterpret_cast<INT_PTR>(L"Jump forward (Ctrl+Enter)")},
                 {0, 0, TBSTATE_ENABLED, BTNS_SEP, {}, 0, 0},
                 {4, ID_JUMP_ADDR, TBSTATE_ENABLED, BTNS_BUTTON, {}, 0, reinterpret_cast<INT_PTR>(L"Jump to address")},
                 {5, ID_DECOMPILE, TBSTATE_ENABLED, BTNS_BUTTON, {}, 0, reinterpret_cast<INT_PTR>(L"Pseudocode (F5)")},
@@ -8110,6 +8367,12 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         else if (id == ID_SEARCH) search_binary(window);
         else if (id == ID_JUMP_ADDR) jump_to_address(window);
         else if (id == ID_JUMP_BACK) jump_back(window);
+        else if (id == ID_JUMP_FORWARD) jump_forward(window);
+        else if (id == ID_GRAPH_COLLAPSE) { if (g_current_address) toggle_block_collapse(g_current_address); }
+        else if (id == ID_GRAPH_EXPAND_ALL) expand_all_blocks();
+        else if (id == ID_GRAPH_GROUP) group_selected_nodes();
+        else if (id == ID_GRAPH_UNGROUP) { if (g_current_address) ungroup_at(g_current_address); }
+        else if (id == ID_GRAPH_CLEAR_SELECTION) clear_graph_selection();
         else if (id == ID_TOGGLE_BOOKMARK) toggle_bookmark(window);
         else if (id == ID_NEXT_BOOKMARK) next_bookmark(window);
         else if (id == ID_LIST_XREFS) list_xrefs(window);
@@ -8279,6 +8542,13 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         }
         if (TabCtrl_GetCurSel(g_tabs) == 4) set_editor_text();
         return 0;
+    case WM_APPCOMMAND: {
+        // Mouse back/forward (X1/X2) buttons bubble up here from any child view.
+        const int cmd = GET_APPCOMMAND_LPARAM(lparam);
+        if (cmd == APPCOMMAND_BROWSER_BACKWARD) { jump_back(window); return TRUE; }
+        if (cmd == APPCOMMAND_BROWSER_FORWARD) { jump_forward(window); return TRUE; }
+        return DefWindowProcW(window, message, wparam, lparam);
+    }
     case WM_KEYDOWN:
         if (wparam == VK_SPACE) { toggle_graph_listing(window); return 0; }
         if (wparam == VK_HOME && TabCtrl_GetCurSel(g_tabs) == 0) { fit_graph(window); return 0; }
@@ -8561,10 +8831,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show_
     const wchar_t class_name[] = L"GandonProNativeWindow"; WNDCLASSW window_class{}; window_class.hInstance = instance; window_class.lpfnWndProc = window_proc; window_class.lpszClassName = class_name; window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW); window_class.hbrBackground = g_background;
     window_class.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(1)); RegisterClassW(&window_class);
     if (HICON small_icon = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0))) g_small_icon = small_icon;
-    WNDCLASSW graph_class{}; graph_class.hInstance = instance; graph_class.lpfnWndProc = graph_proc; graph_class.lpszClassName = L"GandonGraphView"; graph_class.hCursor = LoadCursorW(nullptr, IDC_ARROW); graph_class.hbrBackground = g_panel; RegisterClassW(&graph_class);
+    WNDCLASSW graph_class{}; graph_class.hInstance = instance; graph_class.lpfnWndProc = graph_proc; graph_class.lpszClassName = L"GandonGraphView"; graph_class.hCursor = LoadCursorW(nullptr, IDC_ARROW); graph_class.hbrBackground = g_panel; graph_class.style = CS_DBLCLKS; RegisterClassW(&graph_class);
     WNDCLASSW navband_class{}; navband_class.hInstance = instance; navband_class.lpfnWndProc = navband_proc; navband_class.lpszClassName = L"GandonNavBand"; navband_class.hCursor = LoadCursorW(nullptr, IDC_HAND); RegisterClassW(&navband_class);
     WNDCLASSW minimap_class{}; minimap_class.hInstance = instance; minimap_class.lpfnWndProc = minimap_proc; minimap_class.lpszClassName = L"GandonMiniMap"; minimap_class.hCursor = LoadCursorW(nullptr, IDC_CROSS); minimap_class.hbrBackground = g_panel; RegisterClassW(&minimap_class);
-    HWND window = CreateWindowExW(0, class_name, L"Gandon-PRO - Native Disassembler [ui build 20]", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS, CW_USEDEFAULT, CW_USEDEFAULT, 1400, 850, nullptr, nullptr, instance, nullptr); if (!window) return 1;
+    HWND window = CreateWindowExW(0, class_name, L"Gandon-PRO - Native Disassembler [ui build 27]", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS, CW_USEDEFAULT, CW_USEDEFAULT, 1400, 850, nullptr, nullptr, instance, nullptr); if (!window) return 1;
     g_main_window = window;
     if (g_small_icon) SendMessageW(window, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(g_small_icon));
     const BOOL dark = g_light_theme ? FALSE : TRUE;
@@ -8603,6 +8873,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show_
         {FVIRTKEY, VK_F9, ID_RUN},
         {FVIRTKEY, VK_HOME, ID_FIT_GRAPH},
         {FVIRTKEY, VK_SPACE, ID_TOGGLE_GRAPH_LIST},
+        {FVIRTKEY, VK_ESCAPE, ID_JUMP_BACK},
+        {FVIRTKEY | FCONTROL, VK_RETURN, ID_JUMP_FORWARD},
         {FVIRTKEY | FSHIFT, VK_F12, ID_VIEW_STRINGS},
         {FVIRTKEY | FSHIFT, VK_F3, ID_VIEW_FUNCTIONS},
         {FVIRTKEY, 'T', ID_STRUCT_OFFSET},

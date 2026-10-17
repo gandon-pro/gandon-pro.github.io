@@ -1,4 +1,5 @@
 #include "gandon/auto_analysis.hpp"
+#include "gandon/stack_frame.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -54,9 +55,29 @@ int main(int argc, char** argv) {
         std::printf("wrote %zu signature(s) to %s\n", made.size(), make_out);
         return 0;
     }
+    bool show_frames = false; int frame_limit = 10;
+    for (int i = 2; i < argc; ++i) if (!std::strcmp(argv[i], "--frames")) { show_frames = true; if (i + 1 < argc && std::isdigit((unsigned char)argv[i + 1][0])) frame_limit = std::atoi(argv[i + 1]); }
+
     gandon::AutoAnalysisOptions options;
     options.signatures = &signatures;
     const auto report = gandon::run_auto_analysis(db, options);
+    if (show_frames) {
+        const bool arm64 = db.image().architecture == gandon::MachineArchitecture::ARM64;
+        const bool win = db.image().format == gandon::BinaryFormat::PE;
+        int shown = 0;
+        for (const auto& f : db.functions()) {
+            if (f.instructions.empty()) continue;
+            const auto frame = gandon::analyze_stack_frame(f, db.image().is_64_bit, arm64, win);
+            if (frame.empty()) continue;
+            std::printf("\n%s  @ %llX\n  proto: %s\n  reg args: %d, alloc: 0x%llX, base: %s\n",
+                        f.name.c_str(), (unsigned long long)f.start, frame.prototype(f.name, win).c_str(),
+                        frame.reg_args, (unsigned long long)frame.alloc,
+                        frame.base == gandon::StackFrame::Base::Rbp ? "rbp" : frame.base == gandon::StackFrame::Base::Rsp ? "rsp" : "none");
+            for (const auto& line : frame.summary_lines()) std::printf("    %s\n", line.c_str());
+            if (++shown >= frame_limit) break;
+        }
+        return 0;
+    }
     std::printf("functions: %zu -> %zu\n", before, db.functions().size());
     for (const auto& line : report.log) std::printf("  %s\n", line.c_str());
     if (show_names) for (const auto& [a, n] : report.new_names) std::printf("  name %llX = %s\n", (unsigned long long)a, n.c_str());

@@ -69,6 +69,7 @@ add_library(gandon_core STATIC
     src/decompiler.cpp
     src/image_tables.cpp
     src/ida_views.cpp
+    src/stack_frame.cpp
     src/types.cpp
     src/binary_diff.cpp
     src/auto_analysis.cpp

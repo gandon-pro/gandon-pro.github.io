@@ -2,6 +2,43 @@
 
 All notable changes to Gandon-PRO are documented in this file.
 
+## [3.1] — 2026-10-17
+
+### Analysis
+
+- Jump-table / `switch` recovery now collapses duplicate table slots to distinct
+  successor blocks, so the control-flow graph gets one edge per real case and the
+  log reports both the raw case count and the distinct-edge count.
+- Stack-frame analysis (`gandon::StackFrame`): detects the rbp/rsp frame base,
+  names `var_`/`arg_` slots, counts register arguments per ABI (MS x64 vs SysV,
+  with shadow-space handling) and synthesises a function prototype. Exposed in the
+  listing/pseudocode and via `gandon_auto --frames`.
+
+### Decompiler
+
+- Packed / integer SIMD is lifted to the Intel intrinsic spelling
+  (`_mm_add_ps`, `_mm_xor_si128`, `_mm256_add_epi32`, `_mm_slli_epi32`, shuffles,
+  packs, …) instead of opaque `__mnemonic` calls, including the xor-with-self
+  zero idiom.
+- ARM64 scalar floating point (fadd/fmul/fdiv/fsqrt/fmadd, scvtf/fcvt/fcvtzs, …)
+  is lifted to real arithmetic and casts instead of opaque intrinsics; fixed the
+  ARM `d0`/`s0` floating-point return being dropped as dead code.
+- `switch` statements inside loops are now structured instead of emitted as
+  `JUMPOUT`; `continue` reaches the loop header and a loop-level break becomes a
+  goto so it is not swallowed by the switch.
+- Further `goto` reduction: a multi-level break whose target is a
+  function-ending tail is inlined, removing both the goto and its label.
+
+### GUI
+
+- Functions window gained `Locals`, `Args`, `Xrefs`, `Calls` and `Instr.`
+  columns with sorting.
+- Jump Back / Jump Forward everywhere (Esc / Ctrl+Enter, toolbar, menu,
+  app-command mouse buttons).
+- Graph nodes can be collapsed to a one-line header, and several nodes can be
+  grouped into a single folded node (Ctrl+click to select, right-click to group
+  or ungroup); groups persist in the `.gnd` session.
+
 ## [3.0] — 2026-10-16
 
 ### IDA-style look and feel

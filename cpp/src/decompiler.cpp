@@ -1116,6 +1116,16 @@ private:
                 for (const auto& s : block_.stmts) if (s.type == Stmt::T::Store && s.value && same(s.value, x)) stored = true;
                 if (!stored) { cx_.return_fp = (std::max)(cx_.return_fp, static_cast<int>(x->fp)); return x; }
             }
+        } else {
+            // AArch64: a floating-point result is returned in d0/s0 when x0 is untouched.
+            if (same(cur_[kRax], var(canonical_name(kRax)))) {
+                const auto it = fp_.find(0);
+                if (it != fp_.end() && it->second->fp) {
+                    bool stored = false;
+                    for (const auto& s : block_.stmts) if (s.type == Stmt::T::Store && s.value && same(s.value, it->second)) stored = true;
+                    if (!stored) { cx_.return_fp = (std::max)(cx_.return_fp, static_cast<int>(it->second->fp)); return it->second; }
+                }
+            }
         }
         if (!same(cur_[kRax], var(canonical_name(kRax)))) return cur_[kRax];
         return cx_.saw_rax_write ? var(canonical_name(kRax)) : nullptr;
@@ -1561,7 +1571,158 @@ private:
                 }
             }
         }
+        if (lift_simd_packed(base, avx, ops, next)) return true;
         return false;
+    }
+
+    // Packed / integer SIMD. Hex-Rays renders these as the Intel intrinsic
+    // (`_mm_add_ps`, `_mm_xor_si128`, `_mm256_add_epi32`, ...) rather than a raw
+    // `__addps`, and recognises the xor-with-self zero idiom. We do the same: the
+    // result is still opaque to the optimiser, but the name tells the reader what
+    // the lane operation is and the destination keeps honest data flow.
+    enum class SimdShape { Bin, Un, BinImm, UnImm, Shift, ShiftByte, Movmsk };
+    bool lift_simd_packed(const std::string& base, bool avx, const std::vector<Operand>& ops, std::uint64_t next) {
+        if (ops.empty()) return false;
+        const auto op = [&](std::size_t i) -> const Operand& { static const Operand none; return i < ops.size() ? ops[i] : none; };
+        struct Entry { const char* infix; SimdShape shape; };
+        static const std::unordered_map<std::string, Entry> table = {
+            // ---- floating point packed
+            {"addps",{"add_ps",SimdShape::Bin}},   {"addpd",{"add_pd",SimdShape::Bin}},
+            {"subps",{"sub_ps",SimdShape::Bin}},   {"subpd",{"sub_pd",SimdShape::Bin}},
+            {"mulps",{"mul_ps",SimdShape::Bin}},   {"mulpd",{"mul_pd",SimdShape::Bin}},
+            {"divps",{"div_ps",SimdShape::Bin}},   {"divpd",{"div_pd",SimdShape::Bin}},
+            {"minps",{"min_ps",SimdShape::Bin}},   {"minpd",{"min_pd",SimdShape::Bin}},
+            {"maxps",{"max_ps",SimdShape::Bin}},   {"maxpd",{"max_pd",SimdShape::Bin}},
+            {"andps",{"and_ps",SimdShape::Bin}},   {"andpd",{"and_pd",SimdShape::Bin}},
+            {"andnps",{"andnot_ps",SimdShape::Bin}},{"andnpd",{"andnot_pd",SimdShape::Bin}},
+            {"orps",{"or_ps",SimdShape::Bin}},     {"orpd",{"or_pd",SimdShape::Bin}},
+            {"xorps",{"xor_ps",SimdShape::Bin}},   {"xorpd",{"xor_pd",SimdShape::Bin}},
+            {"haddps",{"hadd_ps",SimdShape::Bin}}, {"haddpd",{"hadd_pd",SimdShape::Bin}},
+            {"hsubps",{"hsub_ps",SimdShape::Bin}}, {"hsubpd",{"hsub_pd",SimdShape::Bin}},
+            {"addsubps",{"addsub_ps",SimdShape::Bin}}, {"addsubpd",{"addsub_pd",SimdShape::Bin}},
+            {"unpcklps",{"unpacklo_ps",SimdShape::Bin}}, {"unpckhps",{"unpackhi_ps",SimdShape::Bin}},
+            {"unpcklpd",{"unpacklo_pd",SimdShape::Bin}}, {"unpckhpd",{"unpackhi_pd",SimdShape::Bin}},
+            {"sqrtps",{"sqrt_ps",SimdShape::Un}},  {"sqrtpd",{"sqrt_pd",SimdShape::Un}},
+            {"rcpps",{"rcp_ps",SimdShape::Un}},    {"rsqrtps",{"rsqrt_ps",SimdShape::Un}},
+            {"shufps",{"shuffle_ps",SimdShape::BinImm}}, {"shufpd",{"shuffle_pd",SimdShape::BinImm}},
+            {"cmpps",{"cmp_ps",SimdShape::BinImm}}, {"cmppd",{"cmp_pd",SimdShape::BinImm}},
+            {"blendps",{"blend_ps",SimdShape::BinImm}}, {"blendpd",{"blend_pd",SimdShape::BinImm}},
+            {"dpps",{"dp_ps",SimdShape::BinImm}},  {"dppd",{"dp_pd",SimdShape::BinImm}},
+            {"insertps",{"insert_ps",SimdShape::BinImm}},
+            {"movmskps",{"movemask_ps",SimdShape::Movmsk}}, {"movmskpd",{"movemask_pd",SimdShape::Movmsk}},
+            // ---- integer packed
+            {"paddb",{"add_epi8",SimdShape::Bin}}, {"paddw",{"add_epi16",SimdShape::Bin}},
+            {"paddd",{"add_epi32",SimdShape::Bin}},{"paddq",{"add_epi64",SimdShape::Bin}},
+            {"psubb",{"sub_epi8",SimdShape::Bin}}, {"psubw",{"sub_epi16",SimdShape::Bin}},
+            {"psubd",{"sub_epi32",SimdShape::Bin}},{"psubq",{"sub_epi64",SimdShape::Bin}},
+            {"paddsb",{"adds_epi8",SimdShape::Bin}},{"paddsw",{"adds_epi16",SimdShape::Bin}},
+            {"paddusb",{"adds_epu8",SimdShape::Bin}},{"paddusw",{"adds_epu16",SimdShape::Bin}},
+            {"psubsb",{"subs_epi8",SimdShape::Bin}},{"psubsw",{"subs_epi16",SimdShape::Bin}},
+            {"psubusb",{"subs_epu8",SimdShape::Bin}},{"psubusw",{"subs_epu16",SimdShape::Bin}},
+            {"pmullw",{"mullo_epi16",SimdShape::Bin}}, {"pmulld",{"mullo_epi32",SimdShape::Bin}},
+            {"pmulhw",{"mulhi_epi16",SimdShape::Bin}}, {"pmulhuw",{"mulhi_epu16",SimdShape::Bin}},
+            {"pmuludq",{"mul_epu32",SimdShape::Bin}},  {"pmaddwd",{"madd_epi16",SimdShape::Bin}},
+            {"pand",{"and_si128",SimdShape::Bin}}, {"pandn",{"andnot_si128",SimdShape::Bin}},
+            {"por",{"or_si128",SimdShape::Bin}},   {"pxor",{"xor_si128",SimdShape::Bin}},
+            {"pcmpeqb",{"cmpeq_epi8",SimdShape::Bin}}, {"pcmpeqw",{"cmpeq_epi16",SimdShape::Bin}},
+            {"pcmpeqd",{"cmpeq_epi32",SimdShape::Bin}},{"pcmpeqq",{"cmpeq_epi64",SimdShape::Bin}},
+            {"pcmpgtb",{"cmpgt_epi8",SimdShape::Bin}}, {"pcmpgtw",{"cmpgt_epi16",SimdShape::Bin}},
+            {"pcmpgtd",{"cmpgt_epi32",SimdShape::Bin}},
+            {"pmaxub",{"max_epu8",SimdShape::Bin}},{"pmaxsw",{"max_epi16",SimdShape::Bin}},
+            {"pminub",{"min_epu8",SimdShape::Bin}},{"pminsw",{"min_epi16",SimdShape::Bin}},
+            {"pmaxsb",{"max_epi8",SimdShape::Bin}},{"pmaxuw",{"max_epu16",SimdShape::Bin}},
+            {"pmaxsd",{"max_epi32",SimdShape::Bin}},{"pmaxud",{"max_epu32",SimdShape::Bin}},
+            {"pminsb",{"min_epi8",SimdShape::Bin}},{"pminuw",{"min_epu16",SimdShape::Bin}},
+            {"pminsd",{"min_epi32",SimdShape::Bin}},{"pminud",{"min_epu32",SimdShape::Bin}},
+            {"pavgb",{"avg_epu8",SimdShape::Bin}}, {"pavgw",{"avg_epu16",SimdShape::Bin}},
+            {"psadbw",{"sad_epu8",SimdShape::Bin}},{"pshufb",{"shuffle_epi8",SimdShape::Bin}},
+            {"packsswb",{"packs_epi16",SimdShape::Bin}}, {"packssdw",{"packs_epi32",SimdShape::Bin}},
+            {"packuswb",{"packus_epi16",SimdShape::Bin}},{"packusdw",{"packus_epi32",SimdShape::Bin}},
+            {"punpcklbw",{"unpacklo_epi8",SimdShape::Bin}}, {"punpcklwd",{"unpacklo_epi16",SimdShape::Bin}},
+            {"punpckldq",{"unpacklo_epi32",SimdShape::Bin}},{"punpcklqdq",{"unpacklo_epi64",SimdShape::Bin}},
+            {"punpckhbw",{"unpackhi_epi8",SimdShape::Bin}}, {"punpckhwd",{"unpackhi_epi16",SimdShape::Bin}},
+            {"punpckhdq",{"unpackhi_epi32",SimdShape::Bin}},{"punpckhqdq",{"unpackhi_epi64",SimdShape::Bin}},
+            {"palignr",{"alignr_epi8",SimdShape::BinImm}}, {"pblendw",{"blend_epi16",SimdShape::BinImm}},
+            {"pabsb",{"abs_epi8",SimdShape::Un}},  {"pabsw",{"abs_epi16",SimdShape::Un}}, {"pabsd",{"abs_epi32",SimdShape::Un}},
+            {"psignb",{"sign_epi8",SimdShape::Bin}},{"psignw",{"sign_epi16",SimdShape::Bin}},{"psignd",{"sign_epi32",SimdShape::Bin}},
+            {"pshufd",{"shuffle_epi32",SimdShape::UnImm}}, {"pshuflw",{"shufflelo_epi16",SimdShape::UnImm}}, {"pshufhw",{"shufflehi_epi16",SimdShape::UnImm}},
+            {"pmovmskb",{"movemask_epi8",SimdShape::Movmsk}},
+            // ---- shifts (slli vs sll chosen by operand kind below)
+            {"psllw",{"w",SimdShape::Shift}}, {"pslld",{"d",SimdShape::Shift}}, {"psllq",{"q",SimdShape::Shift}},
+            {"psrlw",{"w",SimdShape::Shift}}, {"psrld",{"d",SimdShape::Shift}}, {"psrlq",{"q",SimdShape::Shift}},
+            {"psraw",{"w",SimdShape::Shift}}, {"psrad",{"d",SimdShape::Shift}},
+            {"pslldq",{"sl",SimdShape::ShiftByte}}, {"psrldq",{"sr",SimdShape::ShiftByte}},
+        };
+        const auto it = table.find(base);
+        if (it == table.end()) return false;
+        const SimdShape shape = it->second.shape;
+
+        // Vector width from the first xmm/ymm operand: 32 -> _mm256_, else _mm_.
+        int width = 16;
+        for (const auto& o : ops) if (is_xmm_op(o)) { width = o.reg.size >= 32 ? 32 : 16; break; }
+
+        // Zero idiom: pxor/xorps/xorpd with identical source registers -> 0.
+        if (base == "pxor" || base == "xorps" || base == "xorpd") {
+            const Operand& a = avx ? op(1) : op(0);
+            const Operand& b = avx ? op(2) : op(1);
+            if (is_xmm_op(a) && is_xmm_op(b) && a.reg.index == b.reg.index && is_xmm_op(op(0))) {
+                write_full(op(0).reg.index, konst(0, width));
+                return true;
+            }
+        }
+
+        // Source operand indices by shape (AVX forms are non-destructive: dst=op0,
+        // sources from op1). `last` is the final operand (usually an imm).
+        const std::size_t last = ops.size() - 1;
+        std::vector<std::size_t> idx;
+        bool count_is_imm = last < ops.size() && op(last).type == Operand::T::Imm;
+        switch (shape) {
+        case SimdShape::Bin:       idx = avx ? std::vector<std::size_t>{1, 2} : std::vector<std::size_t>{0, 1}; break;
+        case SimdShape::Un:        idx = {last}; break;
+        case SimdShape::BinImm:    idx = avx ? std::vector<std::size_t>{1, 2, last} : std::vector<std::size_t>{0, 1, last}; break;
+        case SimdShape::UnImm:     idx = {1, last}; break;
+        case SimdShape::Shift:     idx = avx ? std::vector<std::size_t>{1, 2} : std::vector<std::size_t>{0, 1}; break;
+        case SimdShape::ShiftByte: idx = avx ? std::vector<std::size_t>{1, 2} : std::vector<std::size_t>{0, 1}; count_is_imm = true; break;
+        case SimdShape::Movmsk:    idx = {1}; break;
+        }
+        for (const auto i : idx) if (i >= ops.size()) return false;   // malformed / unexpected encoding
+
+        // Build the intrinsic name.
+        std::string infix = it->second.infix;
+        if (shape == SimdShape::Shift) {
+            const char elem = infix[0];                 // 'w' | 'd' | 'q'
+            const std::string dir = base[2] == 'l' ? (base[3] == 'l' ? "sll" : "srl") : "sra";  // ps[ll|rl|ra]
+            std::string name = dir.substr(0, 2);        // "sl" / "sr"
+            if (dir == "sra") name = "sra";
+            if (count_is_imm) name += "i";
+            infix = name + "_epi" + std::string(elem == 'w' ? "16" : elem == 'd' ? "32" : "64");
+        } else if (shape == SimdShape::ShiftByte) {
+            infix = std::string(infix == "sl" ? "slli" : "srli") + "_si128";
+        }
+        std::string name = (width == 32 ? "_mm256_" : "_mm_") + infix;
+        if (width == 32) { const auto p = name.find("si128"); if (p != std::string::npos) name.replace(p, 5, "si256"); }
+
+        // Read the chosen sources.
+        auto read_src = [&](const Operand& o) -> EP {
+            if (is_xmm_op(o)) return cur_[o.reg.index];
+            if (o.type == Operand::T::Mem) return deref(width, address_of(o.mem, next));
+            if (o.type == Operand::T::Imm) return konst(static_cast<std::uint64_t>(o.imm));
+            if (o.type == Operand::T::Reg) return read_operand(o, o.reg.size, next);
+            return konst(0);
+        };
+        std::vector<EP> args;
+        for (const auto i : idx) args.push_back(read_src(op(i)));
+
+        const EP result = intrin(name, std::move(args));
+        if (shape == SimdShape::Movmsk) {
+            if (op(0).type == Operand::T::Reg && !is_xmm_op(op(0))) write_reg(op(0).reg, result);
+            else emit_eval(result);
+        } else if (is_xmm_op(op(0))) {
+            write_full(op(0).reg.index, result);
+        } else {
+            return false;
+        }
+        return true;
     }
 
     // ------------------------------------------------------------------ x87
@@ -1746,8 +1907,17 @@ private:
     EP fp_read(const ArmOp& o) {
         const auto it = fp_.find(o.index);
         const EP v = it != fp_.end() ? it->second : var("v" + std::to_string(o.index), 16);
+        if (v->fp) return v;   // a typed floating-point value must stay intact (not bit-sliced)
         return o.fp_size < 8 && !o.vector ? cast(o.fp_size, false, v) : v;
     }
+    // Scalar floating-point type of an s/d register operand: 1 = float, 2 = double.
+    int arm_fp_type(const ArmOp& o) const { return o.fp_size == 4 ? 1 : 2; }
+    EP arm_fp_read(const ArmOp& o, int fp) {
+        const auto it = fp_.find(o.index);
+        const EP v = it != fp_.end() ? it->second : var("v" + std::to_string(o.index), 16);
+        return fp_view(v, fp);
+    }
+    void arm_fp_write(const ArmOp& o, const EP& value, int fp) { fp_[o.index] = simple(value) ? value : fp_temp(value, fp); }
     void fp_write(const ArmOp& o, const EP& value) {
         const EP v = o.fp_size < 8 && !o.vector ? cast(o.fp_size, false, value) : value;
         fp_[o.index] = simple(v) ? v : materialize(v, o.fp_size > 8 ? 8 : o.fp_size);
@@ -2040,10 +2210,52 @@ private:
             if (op(0).type == ArmOp::T::Fp) { fp_write(op(0), intrin("__fimm", {})); return; }
         }
         if ((m == "fcmp" || m == "fcmpe") && ops.size() >= 2) {
+            const int t = op(0).type == ArmOp::T::Fp ? arm_fp_type(op(0)) : 2;
             Flags f; f.type = Flags::T::Cmp; f.fp = true; f.size = 8;
-            f.a = op(0).type == ArmOp::T::Fp ? fp_read(op(0)) : konst(0);
-            f.b = op(1).type == ArmOp::T::Fp ? fp_read(op(1)) : konst(0);
+            f.a = op(0).type == ArmOp::T::Fp ? arm_fp_read(op(0), t) : fconst_double(0.0, t);
+            f.b = op(1).type == ArmOp::T::Fp ? arm_fp_read(op(1), t) : fconst_double(0.0, t);
             flags_ = f; return;
+        }
+
+        // ---- scalar floating-point arithmetic and conversions (s = float, d = double)
+        if (op(0).type == ArmOp::T::Fp && !op(0).vector) {
+            const int t = arm_fp_type(op(0));
+            static const std::map<std::string, std::string> farith{{"fadd", "+"}, {"fsub", "-"}, {"fmul", "*"}, {"fdiv", "/"}, {"fnmul", "*"}};
+            if (const auto it = farith.find(m); it != farith.end() && ops.size() >= 3 && op(1).type == ArmOp::T::Fp && op(2).type == ArmOp::T::Fp) {
+                EP r = fbin(it->second, arm_fp_read(op(1), t), arm_fp_read(op(2), t), t);
+                if (m == "fnmul") r = fneg(r);
+                arm_fp_write(op(0), r, t); return;
+            }
+            if (m == "fneg" && ops.size() >= 2 && op(1).type == ArmOp::T::Fp) { arm_fp_write(op(0), fneg(arm_fp_read(op(1), t)), t); return; }
+            if (m == "fabs" && ops.size() >= 2 && op(1).type == ArmOp::T::Fp) { arm_fp_write(op(0), fintrin(t == 1 ? "fabsf" : "fabs", {arm_fp_read(op(1), t)}, t), t); return; }
+            if (m == "fsqrt" && ops.size() >= 2 && op(1).type == ArmOp::T::Fp) { arm_fp_write(op(0), fintrin(t == 1 ? "sqrtf" : "sqrt", {arm_fp_read(op(1), t)}, t), t); return; }
+            if ((m == "fmax" || m == "fmin" || m == "fmaxnm" || m == "fminnm") && ops.size() >= 3 && op(1).type == ArmOp::T::Fp && op(2).type == ArmOp::T::Fp) {
+                const bool mn = m.rfind("fmin", 0) == 0;
+                arm_fp_write(op(0), fintrin(mn ? (t == 1 ? "fminf" : "fmin") : (t == 1 ? "fmaxf" : "fmax"), {arm_fp_read(op(1), t), arm_fp_read(op(2), t)}, t), t); return;
+            }
+            if ((m == "fmadd" || m == "fmsub" || m == "fnmadd" || m == "fnmsub") && ops.size() >= 4 &&
+                op(1).type == ArmOp::T::Fp && op(2).type == ArmOp::T::Fp && op(3).type == ArmOp::T::Fp) {
+                EP prod = fbin("*", arm_fp_read(op(1), t), arm_fp_read(op(2), t), t);
+                if (m == "fnmadd" || m == "fnmsub") prod = fneg(prod);
+                arm_fp_write(op(0), fbin((m == "fmsub" || m == "fnmsub") ? "-" : "+", prod, arm_fp_read(op(3), t), t), t); return;
+            }
+            if ((m == "scvtf" || m == "ucvtf") && ops.size() >= 2 && op(1).type == ArmOp::T::Reg) {   // integer -> float
+                const int sz = size_of(op(1)); EP iv = arm_read(op(1), sz);
+                iv = m == "scvtf" ? arm_signed(iv, sz) : cast(sz, false, iv);
+                arm_fp_write(op(0), fcast_to(t, iv), t); return;
+            }
+            if (m == "fcvt" && ops.size() >= 2 && op(1).type == ArmOp::T::Fp) {   // precision convert (fcvt d, s)
+                arm_fp_write(op(0), fcast_to(t, arm_fp_read(op(1), arm_fp_type(op(1)))), t); return;
+            }
+            if (m.rfind("frint", 0) == 0 && ops.size() >= 2 && op(1).type == ArmOp::T::Fp) {   // round to integral
+                const char* fn = (m == "frintz" || m == "frintm") ? (t == 1 ? "truncf" : "trunc") : (t == 1 ? "roundf" : "round");
+                arm_fp_write(op(0), fintrin(fn, {arm_fp_read(op(1), t)}, t), t); return;
+            }
+        }
+        // float -> integer: fcvtzs / fcvtzu / fcvtas / ... w0, d0
+        if (op(0).type == ArmOp::T::Reg && !op(0).zr && ops.size() >= 2 && op(1).type == ArmOp::T::Fp &&
+            m.rfind("fcvt", 0) == 0 && m != "fcvt") {
+            arm_write(op(0), fcast_from(size_of(op(0)), arm_fp_read(op(1), arm_fp_type(op(1))))); return;
         }
 
         // ---- memory
@@ -3020,7 +3232,7 @@ private:
     std::size_t gotos_{0};
     int cloning_{0};
     std::vector<std::pair<int, std::size_t>> switch_merges_;   // (merge block, loop depth) of enclosing switches
-    int clone_budget_{240};
+    int clone_budget_{600};
 
     const Block& blk(int i) const { return cx_.blocks[i]; }
 
@@ -3156,11 +3368,11 @@ private:
     // jump site instead of emitting `goto LABEL`. Keeps shared epilogues readable.
     bool tail_copy(int b, Seq& out) {
         Seq tmp; int total = 0; int cur = b;
-        for (int hops = 0; hops < 4 && cur >= 0; ++hops) {
+        for (int hops = 0; hops < 6 && cur >= 0; ++hops) {
             if (is_header_[cur]) return false;
             const auto& bl = blk(cur);
             for (const auto& s : bl.stmts) { auto node = make_node(Node::T::Stmt); node->stmt = s; node->address = s.source; tmp.push_back(std::move(node)); ++total; }
-            if (total > 10) return false;
+            if (total > 20) return false;
             const auto& term = bl.term;
             if (term.type == Terminator::T::Fall) { cur = term.fall_block; continue; }
             if (term.type == Terminator::T::Jmp) { cur = term.taken_block; continue; }
@@ -3177,14 +3389,17 @@ private:
     bool region_small(int b, std::set<int>& seen, int& stmts) const {
         if (b < 0 || seen.contains(b)) return true;
         if (is_header_[b] || rpo_index_[b] < 0) return false;
+        // Never clone a block that is the header or exit of an active loop, or a
+        // switch/indirect region: those would break loop/switch control flow.
+        for (const auto& l : loops_) if (b == l.header || b == l.after) return false;
         seen.insert(b);
-        if (seen.size() > 14) return false;
+        if (seen.size() > 24) return false;
         const auto& bl = blk(b);
         stmts += static_cast<int>(bl.stmts.size());
-        if (stmts > 48) return false;
+        if (stmts > 80) return false;
         switch (bl.term.type) {
         case Terminator::T::Ret: case Terminator::T::NoReturn: return true;
-        case Terminator::T::IndirectJmp: return false;
+        case Terminator::T::IndirectJmp: case Terminator::T::Switch: return false;
         default: break;
         }
         for (const int s : bl.succ) if (!region_small(s, seen, stmts)) return false;
@@ -3192,7 +3407,9 @@ private:
     }
 
     bool clone_region(int b, Seq& out) {
-        if (!loops_.empty() || cloning_ > 3 || clone_budget_ <= 0) return false;
+        // Cloning is allowed inside loops now that region_small() rejects any
+        // block tied to an active loop's control flow.
+        if (cloning_ > 6 || clone_budget_ <= 0) return false;
         std::set<int> region; int stmts = 0;
         if (!region_small(b, region, stmts) || stmts == 0) return false;
         clone_budget_ -= stmts;
@@ -3218,14 +3435,31 @@ private:
             if (!at_header_entry) {
                 if (!loops_.empty()) {
                     const auto& inner = loops_.back();
+                    // `continue` is never captured by a switch, so it is always correct.
                     if (b == inner.header) { out.push_back(make_node(Node::T::Continue)); break; }
-                    if (b == inner.after) { out.push_back(make_node(Node::T::Break)); break; }
-                    bool outer_target = false;
-                    for (std::size_t i = 0; i + 1 < loops_.size(); ++i) if (b == loops_[i].header || b == loops_[i].after) outer_target = true;
-                    if (outer_target) { out.push_back(make_goto(b)); break; }
+                    // `break`, however, binds to the nearest switch. When a switch is
+                    // open inside this loop, a plain break would leave the switch, not
+                    // the loop, so the loop exit has to be a goto instead.
+                    if (b == inner.after) {
+                        const bool switch_captures_break = !switch_merges_.empty() && switch_merges_.back().second == loops_.size();
+                        if (switch_captures_break) out.push_back(make_goto(b));
+                        else out.push_back(make_node(Node::T::Break));
+                        break;
+                    }
+                    bool outer_header = false, outer_after = false;
+                    for (std::size_t i = 0; i + 1 < loops_.size(); ++i) {
+                        if (b == loops_[i].header) outer_header = true;
+                        if (b == loops_[i].after) outer_after = true;
+                    }
+                    // Multi-level continue has no C spelling, so it stays a goto.
+                    // A multi-level break whose target is a function-ending tail can
+                    // be inlined instead (same trick as the stop/emitted paths),
+                    // which removes both the goto and its label.
+                    if (outer_header) { out.push_back(make_goto(b)); break; }
+                    if (outer_after) { if (!tail_copy(b, out)) out.push_back(make_goto(b)); break; }
                 }
                 if (!switch_merges_.empty() && switch_merges_.back().first == b && switch_merges_.back().second == loops_.size()) { out.push_back(make_node(Node::T::Break)); break; }
-                if (std::find(stops_.begin(), stops_.end(), b) != stops_.end()) { if (!tail_copy(b, out)) out.push_back(make_goto(b)); break; }
+                if (std::find(stops_.begin(), stops_.end(), b) != stops_.end()) { if (!tail_copy(b, out) && !clone_region(b, out)) out.push_back(make_goto(b)); break; }
                 if (emitted_[b]) { if (!tail_copy(b, out) && !clone_region(b, out)) out.push_back(make_goto(b)); break; }
                 if (is_header_[b] && !is_active_header(b)) {
                     const int after = loop_after(b);
@@ -3254,7 +3488,11 @@ private:
                 auto raw = make_node(Node::T::Raw); raw->value = t.value; raw->text = "JUMPOUT"; out.push_back(std::move(raw)); return out;
             }
             case Terminator::T::Switch: {
-                if (!loops_.empty() || cloning_ > 0) { auto raw = make_node(Node::T::Raw); raw->value = t.value; raw->text = "JUMPOUT"; out.push_back(std::move(raw)); return out; }
+                // A switch is structured even inside a loop now: `continue` reaches the
+                // loop header normally and a loop-level break is rewritten to a goto
+                // (see the inner.after handling above). Region cloning still bails to a
+                // JUMPOUT, since a duplicated switch body is rarely worth the size.
+                if (cloning_ > 0) { auto raw = make_node(Node::T::Raw); raw->value = t.value; raw->text = "JUMPOUT"; out.push_back(std::move(raw)); return out; }
                 int merge = ipdom_[b];
                 if (merge == n_) merge = -1;
                 std::vector<int> order; std::map<int, std::vector<std::uint64_t>> values;
@@ -3289,7 +3527,10 @@ private:
                 const int region_stop = merge >= 0 ? merge : stop;
                 if (merge >= 0) stops_.push_back(merge);
                 if (t.external_taken) {
-                    auto raw = make_node(Node::T::Raw); raw->text = "goto"; raw->address = t.taken; branch->body.push_back(std::move(raw));
+                    // Prefer inlining a function-ending tail over a bare goto.
+                    if (!tail_copy(t.taken_block, branch->body) && !clone_region(t.taken_block, branch->body)) {
+                        auto raw = make_node(Node::T::Raw); raw->text = "goto"; raw->address = t.taken; branch->body.push_back(std::move(raw));
+                    }
                 } else {
                     branch->body = emit(t.taken_block, region_stop, false);
                 }

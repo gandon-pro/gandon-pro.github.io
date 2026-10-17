@@ -47,6 +47,9 @@ struct AutoAnalysisReport {
     std::size_t import_thunks{0};
     std::size_t noreturn_functions{0};
     std::size_t rounds{0};
+    std::size_t switches{0};        // indirect jumps resolved as jump tables
+    std::size_t switch_edges{0};    // distinct case targets (= CFG successor edges)
+    std::size_t switch_cases{0};    // total table slots (= source-level case labels)
     std::set<std::uint64_t> noreturn;                 // function starts
     std::map<std::uint64_t, std::string> new_names;   // address -> name chosen by signatures / import thunks
     std::vector<std::string> log;

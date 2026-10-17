@@ -86,6 +86,145 @@ bool is_exec(const BinaryImage& image, std::uint64_t address) {
     return false;
 }
 
+// Recover the case targets of an indirect `jmp` through a jump table (x86/x64).
+// Conservative by design: every candidate target must land in an executable
+// section, and the first failure stops the scan, so a misidentified pattern
+// yields few or no targets rather than corrupting the function body. Handles the
+// three dominant compiler shapes:
+//   * x64 PIC rel32:  lea base,[rip+d] ; movsxd r,[base+idx*4] ; add r,base ; jmp r
+//                     table at `base`, entries are int32 offsets from `base`.
+//   * x64 absolute:   lea base,[rip+d] ; jmp qword ptr [base+idx*8]
+//                     table at `base`, entries are 64-bit absolute addresses.
+//   * x86 absolute:   jmp dword ptr [table+idx*4]   (table is an absolute imm)
+std::vector<std::uint64_t> resolve_switch(const BinaryImage& image, const Instruction& jmp,
+                                          const std::vector<Instruction>& body,
+                                          std::size_t* slot_count = nullptr) {
+    std::vector<std::uint64_t> targets;
+    if (slot_count) *slot_count = 0;
+    if (jmp.operands.empty()) return targets;
+    const bool is64 = image.is_64_bit;
+    const std::size_t ptr = is64 ? 8 : 4;
+
+    auto read = [&](std::uint64_t va, std::size_t n, std::uint64_t& out) -> bool {
+        const auto off = image.va_to_file_offset(va);
+        if (!off || *off + n > image.bytes.size()) return false;
+        out = 0;
+        for (std::size_t i = 0; i < n; ++i) out |= static_cast<std::uint64_t>(image.bytes[*off + i]) << (8 * i);
+        return true;
+    };
+
+    // Instructions in the small window just before the jump, address-sorted.
+    std::vector<const Instruction*> recent;
+    for (const auto& i : body)
+        if (i.address < jmp.address && i.address + 0x80 >= jmp.address) recent.push_back(&i);
+    std::sort(recent.begin(), recent.end(), [](auto a, auto b) { return a->address < b->address; });
+
+    // Parse a memory operand "[reg + idx*scale + disp]": optionally require it to
+    // mention `reg`; return the index scale and the signed displacement.
+    auto parse_mem = [](const std::string& operand, const std::string& reg,
+                        int& scale, long long& disp) -> bool {
+        const auto lb = operand.find('[');
+        if (lb == std::string::npos) return false;
+        const auto rb = operand.find(']', lb);
+        if (rb == std::string::npos) return false;
+        const std::string inner = operand.substr(lb + 1, rb - lb - 1);
+        if (!reg.empty() && inner.find(reg) == std::string::npos) return false;
+        scale = 1; disp = 0;
+        if (const auto star = inner.find('*'); star != std::string::npos) scale = std::atoi(inner.c_str() + star + 1);
+        for (std::size_t i = 0; i + 1 < inner.size(); ++i) {
+            if (inner[i] == '0' && (inner[i + 1] == 'x' || inner[i + 1] == 'X')) {
+                char* endp = nullptr;
+                const auto v = std::strtoull(inner.c_str() + i, &endp, 16);
+                std::size_t j = i; while (j > 0 && inner[j - 1] == ' ') --j;
+                disp = (j > 0 && inner[j - 1] == '-') ? -static_cast<long long>(v) : static_cast<long long>(v);
+                i = static_cast<std::size_t>(endp - inner.c_str()) - 1;
+            }
+        }
+        return true;
+    };
+    auto first_reg = [](const std::string& operands) -> std::string {
+        const auto comma = operands.find(',');
+        std::string r = comma == std::string::npos ? operands : operands.substr(0, comma);
+        const auto s = r.find_first_not_of(' '); if (s != std::string::npos) r = r.substr(s);
+        const auto e = r.find_first_of(" ,"); if (e != std::string::npos) r = r.substr(0, e);
+        return r;
+    };
+
+    // Table base + its register from the most recent `lea reg, [rip+disp]`.
+    std::uint64_t base = 0; bool have_base = false; std::string base_reg;
+    for (auto it = recent.rbegin(); it != recent.rend(); ++it)
+        if (strip_prefix((*it)->mnemonic) == "lea")
+            if (const auto t = rip_target(**it)) { base = *t; have_base = true; base_reg = first_reg((*it)->operands); break; }
+
+    // Case count from a preceding compare against an immediate upper bound.
+    std::uint64_t count = 0;
+    for (auto it = recent.rbegin(); it != recent.rend(); ++it) {
+        const auto m = strip_prefix((*it)->mnemonic);
+        if (m != "cmp" && m != "sub") continue;
+        const auto comma = (*it)->operands.rfind(',');
+        if (comma == std::string::npos) continue;
+        std::string t = (*it)->operands.substr(comma + 1);
+        const auto s = t.find_first_not_of(' ');
+        if (s != std::string::npos) t = t.substr(s);
+        std::uint64_t v = 0;
+        if (parse_hex(t, v) || (v = std::strtoull(t.c_str(), nullptr, 0)) != 0) { count = v + 1; break; }
+    }
+    const std::uint64_t cap = (count && count <= 4096) ? count : 1024;
+
+    const std::string& ops = jmp.operands;
+    const bool memory = ops.find('[') != std::string::npos;
+
+    std::uint64_t table = 0; bool have_table = false; std::size_t stride = 0; bool rel32 = false;
+    int scale = 0; long long disp = 0;
+    if (!memory) {
+        // Register-indirect jump (x64 PIC rel32): a separate load reads the table
+        // as [base + idx*scale + disp]; entries are int32 offsets from base.
+        if (!have_base) return targets;
+        bool found_load = false;
+        for (auto it = recent.rbegin(); it != recent.rend(); ++it) {
+            if ((*it)->operands.find('*') == std::string::npos) continue;
+            if (parse_mem((*it)->operands, base_reg, scale, disp)) { found_load = true; break; }
+        }
+        if (!found_load) { scale = 4; disp = 0; }
+        table = base + static_cast<std::uint64_t>(disp);
+        have_table = true; stride = (scale == 8 ? 8 : 4); rel32 = true;
+    } else {
+        // Memory-indirect jump: entries are absolute pointers. Table = base+disp
+        // (x64 PIC) or the absolute displacement itself (x86 jmp [imm+idx*scale]).
+        parse_mem(ops, std::string(), scale, disp);
+        if (have_base && ops.find(base_reg) != std::string::npos) table = base + static_cast<std::uint64_t>(disp);
+        else if (disp != 0) table = static_cast<std::uint64_t>(disp);
+        else return targets;
+        have_table = true; stride = (scale == 4 ? 4 : ptr); rel32 = false;
+    }
+    (void)have_table;
+
+    for (std::uint64_t i = 0; i < cap; ++i) {
+        std::uint64_t entry = 0;
+        if (!read(table + i * stride, stride, entry)) break;
+        std::uint64_t target;
+        if (rel32) {
+            const auto off32 = static_cast<std::int32_t>(static_cast<std::uint32_t>(entry));
+            target = base + static_cast<std::uint64_t>(static_cast<std::int64_t>(off32));
+        } else {
+            target = entry;
+        }
+        if (!is_exec(image, target)) break;
+        targets.push_back(target);
+    }
+    if (targets.size() < 2) { targets.clear(); return targets; }   // a lone "case" is almost always a false positive
+    if (slot_count) *slot_count = targets.size();                   // total table entries = source-level cases
+    // Collapse to distinct successor blocks: many table slots routinely route to
+    // the same case body (shared handlers, fall-through groups). The CFG has one
+    // edge per distinct target, so duplicates here would inflate the edge count
+    // and plant duplicate xrefs / graph edges.
+    std::vector<std::uint64_t> distinct;
+    distinct.reserve(targets.size());
+    for (const auto t : targets)
+        if (std::find(distinct.begin(), distinct.end(), t) == distinct.end()) distinct.push_back(t);
+    return distinct;
+}
+
 const std::unordered_set<std::string>& noreturn_names() {
     static const std::unordered_set<std::string> names = {
         "exit", "_exit", "_Exit", "abort", "quick_exit", "ExitProcess", "ExitThread", "RtlExitUserProcess", "RtlExitUserThread",
@@ -420,6 +559,18 @@ AutoAnalysisReport run_auto_analysis(AnalysisDatabase& db, const AutoAnalysisOpt
                         if (m_is_uncond(m)) {
                             if (direct && target >= start && target < start + 0x8000 && is_exec(image, target) && !function_starts.count(target))
                                 work.push_back(target);
+                            else if (!direct && !g_arm64) {
+                                // Indirect jmp: recover switch/jump-table case targets.
+                                std::size_t slots = 0;
+                                const auto cases = resolve_switch(image, ins, body, &slots);
+                                if (!cases.empty()) { ++report.switches; report.switch_edges += cases.size(); report.switch_cases += slots; }
+                                for (const auto t : cases)
+                                    if (is_exec(image, t) && !function_starts.count(t) &&
+                                        t + 0x40000 >= start && t < start + 0x40000) {
+                                        work.push_back(t);
+                                        db.add_xref({ins.address, t, "jmp"});
+                                    }
+                            }
                             break;
                         }
                         if (m_is_cond(m)) {
@@ -456,6 +607,33 @@ AutoAnalysisReport run_auto_analysis(AnalysisDatabase& db, const AutoAnalysisOpt
         }
         if (report.functions_added) db.sort_functions();
         report.log.push_back("recursive descent: " + std::to_string(report.functions_added) + " new function(s) in " + std::to_string(report.rounds) + " round(s)");
+        // Second pass: resolve switch tables in every function body (including
+        // those loaded before analysis, e.g. exports), recording the case edges
+        // as xrefs so the CFG, graph and decompiler see them.
+        if (!g_arm64) {
+            std::vector<Xref> switch_xrefs;
+            for (const auto& f : db.functions()) {
+                for (const auto& ins : f.instructions) {
+                    if (!m_is_uncond(strip_prefix(ins.mnemonic))) continue;
+                    std::uint64_t direct = 0;
+                    if (direct_target(ins, direct)) continue;        // only indirect jumps
+                    bool already = false;
+                    for (const auto& xr : db.xrefs_at(ins.address))
+                        if (xr.get().kind == "jmp" || xr.get().kind == "switch") { already = true; break; }
+                    if (already) continue;
+                    std::size_t slots = 0;
+                    const auto cases = resolve_switch(image, ins, f.instructions, &slots);
+                    if (cases.empty()) continue;
+                    ++report.switches; report.switch_edges += cases.size(); report.switch_cases += slots;
+                    for (const auto t : cases) switch_xrefs.push_back({ins.address, t, "switch"});
+                }
+            }
+            for (const auto& x : switch_xrefs) db.add_xref(x);
+        }
+        if (report.switches)
+            report.log.push_back("switch tables: " + std::to_string(report.switches) + " resolved, " +
+                                 std::to_string(report.switch_cases) + " case(s) -> " +
+                                 std::to_string(report.switch_edges) + " distinct edge(s)");
     }
 
     // ---- 2. names: imports + thunks + signatures

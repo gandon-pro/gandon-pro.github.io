@@ -1,6 +1,7 @@
 #include "gandon/ida_views.hpp"
 
 #include "gandon/image_tables.hpp"
+#include "gandon/stack_frame.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -164,6 +165,15 @@ struct IdaViews::Impl {
         const auto row = row_containing(a);
         if (!row) return nullptr;
         return &db.functions()[row->function];
+    }
+
+    mutable std::unordered_map<std::uint64_t, StackFrame> frame_cache_;
+    const StackFrame& frame_for(const Function& f) const {
+        const auto it = frame_cache_.find(f.start);
+        if (it != frame_cache_.end()) return it->second;
+        const bool arm64 = db.image().architecture == MachineArchitecture::ARM64;
+        const bool win = db.image().format == BinaryFormat::PE;
+        return frame_cache_.emplace(f.start, analyze_stack_frame(f, db.image().is_64_bit, arm64, win)).first->second;
     }
 
     const Row* row_containing(std::uint64_t a) const {
@@ -482,16 +492,30 @@ struct IdaViews::Impl {
             if (name.empty()) name = "loc_" + hex(target);
             return "cs:" + name;
         }
-        // Stack frame variables: [rbp - N] / [rbp + N] without an index.
+        // Stack frame variables: name [rbp +/- N] and [rsp + N] (and ebp/esp)
+        // via the reconstructed frame of the enclosing function.
         std::string compact;
         for (char c : inside) if (c != ' ') compact.push_back(c);
-        if (compact.rfind("rbp", 0) == 0 && compact.find('*') == std::string::npos && compact.find('+', 3) == std::string::npos
-            && compact.size() > 4 && (compact[3] == '-' || compact[3] == '+')) {
-            std::size_t end = 0;
-            if (is_hex_literal(compact, 4, end) && end == compact.size()) {
-                const auto disp = std::strtoull(compact.c_str() + 6, nullptr, 16);
-                if (compact[3] == '-') result = "[rbp+var_" + hex(disp) + "]";
-                else if (disp >= 0x10) result = "[rbp+arg_" + hex(disp - 0x10) + "]";
+        if (compact.find('*') == std::string::npos && compact.size() > 4) {
+            std::size_t r = 0;
+            while (r < compact.size() && std::isalpha(static_cast<unsigned char>(compact[r]))) ++r;
+            const std::string reg = compact.substr(0, r);
+            if ((reg == "rbp" || reg == "ebp" || reg == "rsp" || reg == "esp") &&
+                r < compact.size() && (compact[r] == '-' || compact[r] == '+')) {
+                std::size_t end = 0;
+                if (is_hex_literal(compact, r + 1, end) && end == compact.size()) {
+                    long long disp = static_cast<long long>(std::strtoull(compact.c_str() + r + 3, nullptr, 16));
+                    if (compact[r] == '-') disp = -disp;
+                    if (const auto* f = function_at_address(ins.address)) {
+                        const auto& frame = frame_for(*f);
+                        if (const auto name = frame.rename(reg, disp)) result = "[" + reg + "+" + *name + "]";
+                        // Preserve the previous rbp-local display when no rsp frame
+                        // was identified (keeps behaviour on unusual prologues).
+                        else if (result.empty() && (reg == "rbp" || reg == "ebp") && disp < 0 &&
+                                 frame.base != StackFrame::Base::Rsp)
+                            result = "[" + reg + "+var_" + hex(static_cast<std::uint64_t>(-disp)) + "]";
+                    }
+                }
             }
         }
         if (result.empty() && cfg.types) {
@@ -738,7 +762,12 @@ struct IdaViews::Impl {
             out << prefix << '\n';
             lines += 2;
             if (cfg.noreturn.count(ins.address)) { out << prefix << "; Attributes: noreturn\n" << prefix << '\n'; lines += 2; }
-            if (const auto proto = cfg.prototypes.find(ins.address); proto != cfg.prototypes.end()) { out << prefix << "; " << proto->second << "\n"; ++lines; }
+            const auto& frame = frame_for(f);
+            const auto user_proto = cfg.prototypes.find(ins.address);
+            if (user_proto != cfg.prototypes.end()) { out << prefix << "; " << user_proto->second << "\n"; ++lines; }
+            else if (!frame.empty()) { out << prefix << "; " << frame.prototype(name, db.image().format == BinaryFormat::PE) << "\n"; ++lines; }
+            for (const auto& fv : frame.summary_lines()) { out << prefix << "; " << fv << "\n"; ++lines; }
+            if (!frame.summary_lines().empty()) { out << prefix << '\n'; ++lines; }
             emit_with_xrefs(out, lines, ins.address, pad(name, 15) + " proc near", xref_items(ins.address, true), "CODE XREF");
             const auto data_items = xref_items(ins.address, false);
             if (!data_items.empty()) emit_with_xrefs(out, lines, ins.address, "", data_items, "DATA XREF");

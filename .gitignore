@@ -9,3 +9,6 @@ __pycache__/
 .vscode/
 .idea/
 cpp/third_party/
+
+server_token.txt
+*.token
