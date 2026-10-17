@@ -82,7 +82,3 @@ cpp/CMakeLists.txt
 Нужны: `gandon_gui.exe`, `capstone.dll` рядом с ним, папка
 `plugins\python` (встроенная Python-консоль), и опционально Python в
 PATH. Папка `signatures\*.pat` рядом с exe — для FLIRT-сигнатур.
-
-## Лицензия
-
-Добавьте файл `LICENSE` с условиями, на которых распространяете проект.
