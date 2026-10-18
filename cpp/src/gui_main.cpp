@@ -9434,7 +9434,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show_
     WNDCLASSW graph_class{}; graph_class.hInstance = instance; graph_class.lpfnWndProc = graph_proc; graph_class.lpszClassName = L"GandonGraphView"; graph_class.hCursor = LoadCursorW(nullptr, IDC_ARROW); graph_class.hbrBackground = g_panel; graph_class.style = CS_DBLCLKS; RegisterClassW(&graph_class);
     WNDCLASSW navband_class{}; navband_class.hInstance = instance; navband_class.lpfnWndProc = navband_proc; navband_class.lpszClassName = L"GandonNavBand"; navband_class.hCursor = LoadCursorW(nullptr, IDC_HAND); RegisterClassW(&navband_class);
     WNDCLASSW minimap_class{}; minimap_class.hInstance = instance; minimap_class.lpfnWndProc = minimap_proc; minimap_class.lpszClassName = L"GandonMiniMap"; minimap_class.hCursor = LoadCursorW(nullptr, IDC_CROSS); minimap_class.hbrBackground = g_panel; RegisterClassW(&minimap_class);
-    HWND window = CreateWindowExW(0, class_name, L"Gandon-PRO - Native Disassembler [ui build 32]", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS, CW_USEDEFAULT, CW_USEDEFAULT, 1400, 850, nullptr, nullptr, instance, nullptr); if (!window) return 1;
+    HWND window = CreateWindowExW(0, class_name, L"Gandon-PRO - Native Disassembler", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS, CW_USEDEFAULT, CW_USEDEFAULT, 1400, 850, nullptr, nullptr, instance, nullptr); if (!window) return 1;
     g_main_window = window;
     if (g_small_icon) SendMessageW(window, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(g_small_icon));
     const BOOL dark = g_light_theme ? FALSE : TRUE;
