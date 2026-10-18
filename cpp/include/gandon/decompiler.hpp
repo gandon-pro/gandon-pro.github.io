@@ -21,6 +21,11 @@ struct DecompilerOptions {
     std::function<std::string(std::uint64_t)> name_of;
     // Returns true when the function at the address never returns (calls to it end the block).
     std::function<bool(std::uint64_t)> is_noreturn;
+    // Interprocedural hint: the recovered integer-argument count of a locally
+    // defined callee, so a direct `call sub_X` renders with the callee's real
+    // parameters even when the caller does not set every argument register in
+    // this block. Return a negative value when nothing is known.
+    std::function<int(std::uint64_t)> arg_count_of;
 };
 
 struct DecompileResult {
@@ -29,6 +34,11 @@ struct DecompileResult {
     std::string text;            // C-like pseudocode.
     std::size_t block_count{0};
     std::size_t goto_count{0};   // Remaining unstructured jumps.
+    // Recovered signature, usable for interprocedural propagation.
+    int recovered_args{0};       // integer/pointer parameters in the prototype
+    bool returns_value{false};   // function produces a value in rax/xmm0
+    int return_fp{0};            // 1 float, 2 double, 3 long double when FP-returning
+    std::string convention;      // "__fastcall" / "__stdcall" / "System V" / "AAPCS64"
 };
 
 // Decompile one x86-64 function. `instructions` must be the decoded

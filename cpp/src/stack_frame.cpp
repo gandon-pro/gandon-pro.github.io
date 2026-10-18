@@ -194,6 +194,12 @@ std::optional<std::string> StackFrame::rename(const std::string& reg, long long 
     return std::nullopt;
 }
 
+std::string StackFrame::convention(bool windows_abi) const {
+    if (arm64) return "AAPCS64";
+    if (ret_pop > 0) return "__stdcall";
+    return windows_abi ? "__fastcall" : "System V";
+}
+
 std::string StackFrame::prototype(const std::string& func_name, bool windows_abi) const {
     std::size_t stack_args = 0;
     for (const auto& v : vars) if (v.is_arg) {
@@ -204,7 +210,8 @@ std::string StackFrame::prototype(const std::string& func_name, bool windows_abi
     }
     const std::size_t total = static_cast<std::size_t>(reg_args) + stack_args;
     std::ostringstream out;
-    out << "__int64 " << (arm64 ? "" : windows_abi ? "__fastcall " : "") << func_name << "(";
+    const std::string conv = arm64 ? "" : ret_pop > 0 ? "__stdcall " : windows_abi ? "__fastcall " : "";
+    out << "__int64 " << conv << func_name << "(";
     if (total == 0) out << (arm64 ? "" : "void");
     for (std::size_t i = 0; i < total; ++i) {
         if (i) out << ", ";
@@ -297,6 +304,17 @@ StackFrame analyze_stack_frame(const Function& function, bool is_64_bit, bool ar
 
     // ---- 3. register arguments
     if (is_64_bit || arm64) frame.reg_args = count_reg_args(function, arm64, windows_abi);
+
+    // ---- 4. callee stack cleanup: `ret N` marks a __stdcall function.
+    if (!arm64)
+        for (const auto& ins : function.instructions) {
+            const auto m = strip_prefix(ins.mnemonic);
+            if ((m == "ret" || m == "retn") && !ins.operands.empty()) {
+                long long v = 0; std::size_t e = 0;
+                if (parse_disp(no_spaces(ins.operands), 0, v, e) && v > 0 && v < 0x10000)
+                    frame.ret_pop = static_cast<std::uint16_t>(v);
+            }
+        }
     return frame;
 }
 

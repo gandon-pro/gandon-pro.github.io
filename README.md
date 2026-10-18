@@ -1,84 +1,55 @@
-# Gandon-PRO
+# Gandon-PRO 3.2 (Windows x64)
 
-Нативный (C++20) дизассемблер / декомпилятор для Windows с видом и
-поведением в стиле IDA Pro 9.
+Run `gandon_gui.exe`. Windows requests administrator approval through its embedded manifest.
+The startup dialog offers the optional GandonMemory driver. No skips all installation/start actions.
+Pointer scanning and structure dumps also work without a driver through ReadProcessMemory.
 
-![platform](https://img.shields.io/badge/platform-Windows%20x64-blue)
-![language](https://img.shields.io/badge/language-C%2B%2B20-blue)
+Added: bounded/cancellable pointer-chain scan and re-scan, typed/raw structure snapshots,
+reversible native/WOW64 PEB flag masking, optional read-only kernel transport, and driver setup.
+Includes the current decompiler, RTTI, PE dump/IAT and VM-analysis changes.
 
-## Возможности
+## ScyllaHide (optional, manual)
 
-- **Дизассемблер**: PE и ELF, x86, x86-64, ARM64 (через Capstone).
-- **Декомпилятор**: x86-64 и ARM64, `switch` по таблицам переходов,
-  SSE/AVX и x87 (float/double/long double), восстановление структур,
-  enum и прототипов функций.
-- **Вид в стиле IDA**: Gandon View-A (граф), Text Listing, Pseudocode-A,
-  XREFs, Hex View-1, Imports/Exports/Strings/Resources, Local Types,
-  миникарта графа, навигационная полоса.
-- **Докинг-панели**: перетаскивание мышью, подсветка зоны стыковки,
-  плавающие окна, сохранение раскладки.
-- **Авто-анализ**: рекурсивный обход, именование thunk-ов, FLIRT-сигнатуры
-  (`.pat`), распространение noreturn.
-- **Отладчик**: Win32-отладчик с точками останова, чтением регистров и
-  памяти живого процесса.
-- **Сравнение бинарников** по функциям (name / hash / call-graph /
-  similarity), отдельная панель и CLI `gandon_diff`.
-- **Python-консоль**, управляющая всей программой (навигация, правки,
-  отладчик, типы, диф) — двусторонняя связь с GUI.
-- Патч байтов, Undo/Redo на всё (патчи + переименования + комментарии),
-  сохранение базы анализа `.gnd`.
+ScyllaHide 1.4 binaries/configuration are in `ScyllaHide/` and the integration is
+`plugins/python/scyllahide_loader.py`. Install Python 3 with PyQt6 for the Python plugin host
+(`python -m pip install PyQt6`). Load the plugin through the GUI's Load Python Plugin command.
+Start and pause your debuggee. In its ScyllaHide menu, choose the configuration/profile and
+select the matching InjectorCLI and HookLibrary from `ScyllaHide/`: x64 for an x64 target,
+x86 for an x86 target. Injection is requested only by the explicit menu action; nothing is
+injected at application startup. End-to-end injection has not been runtime-tested in this release.
+This is user-mode integration, separate from the optional kernel reader.
 
-Полный список изменений — в [`CHANGELOG.md`](CHANGELOG.md).
+## Test-signed driver
 
-## Сборка (Windows, MSVC / Visual Studio 2022)
+The optional driver is a development build, not Microsoft production-signed.
+See `kernel/out/TEST-SIGNING.md` for certificate installation, test-mode setup and rollback.
+Secure Boot must be off for this ordinary test-signing setup; enabling test mode needs a reboot.
+The program does not change these boot settings. No private signing key is distributed.
 
-```powershell
-cmake -S cpp -B cpp\build -G "Visual Studio 17 2022" -A x64
-cmake --build cpp\build --config Release --target gandon_gui
-```
+The driver checks the caller's process-handle access and only reads user virtual memory.
+It does not hide kernel debug state, remove protections or provide kernel memory writes.
+The kernel path has not been loaded or tested on a live machine.
 
-Нужен [Capstone](https://github.com/capstone-engine/capstone) (заголовки +
-`capstone.dll`/`capstone.lib`). Варианты:
+## Requirements / validation
 
-- положить в `cpp\third_party\capstone\{include,lib}` — CMake подхватит
-  сам через `GANDON_CAPSTONE_ROOT`;
-- либо поставить через vcpkg (`vcpkg install capstone:x64-windows`) и
-  передать `-DCMAKE_TOOLCHAIN_FILE=.../vcpkg.cmake`.
+Microsoft Visual C++ x64 runtime; Python/PyQt6 only for Python plugins.
+Release x64 GUI and CLI compiled with MSVC 2026, Capstone 5.0.9 and Unicorn 2.1.4.
+CTest: 4/4 passed (live process, core, decompiler, unpack/RTTI); type tests passed separately.
+CLI and text views processed the new GUI executable; embedded UAC manifest verified.
+GUI interactive startup and kernel loading have not been tested.
 
-Без Capstone проект всё равно соберётся (встроенный урезанный декодер
-x86), но ARM64 и точность x86 будут хуже.
+## Source and third-party notices
 
-Готовый `capstone.dll` нужно положить рядом с собранным `gandon_gui.exe`
-(либо CMake скопирует его сам post-build, если библиотека была найдена
-при конфигурации).
+Main source: https://github.com/gandon-pro/gandon-pro.github.io/tree/v3.2/cpp
+ScyllaHide (GPL-3.0): https://github.com/x64dbg/ScyllaHide/tree/v1.4
+Capstone license: licenses/Capstone-LICENSE.txt
+Unicorn licenses: licenses/Unicorn-*
+Corresponding ScyllaHide/Unicorn source archives and Gandon relink objects are downloadable
+alongside this release. Relinking/reverse engineering needed to modify the LGPL components
+is permitted. No license restrictions on the main project override these third-party rights.
 
-### Цели сборки
+## Build from source
 
-| Цель | Что это |
-|---|---|
-| `gandon_gui` | GUI |
-| `gandon_cli` | загрузка и краткий обзор бинарника |
-| `gandon_decompile` | декомпиляция из командной строки |
-| `gandon_auto` | авто-анализ, FLIRT-сигнатуры (`--make-pat`/`--verify-pat`) |
-| `gandon_diff` | сравнение двух бинарников по функциям |
-| `gandon_ida_views` | IDA-подобные текстовые представления |
-| `gandon_mcp_backend` | MCP-сервер для управления программой снаружи |
-| `gandon_core_tests`, `gandon_decompiler_tests`, `gandon_types_tests` | тесты (`ctest` после сборки) |
-
-## Структура репозитория
-
-```
-cpp/src/          исходники (.cpp)
-cpp/include/gandon/   заголовки (.hpp/.h)
-cpp/tests/         тесты
-cpp/plugins/       нативный пример-плагин, MCP-плагин, Python-плагины для GUI
-cpp/mcp/           отдельный MCP-сервер (Python)
-cpp/assets/        иконка
-cpp/CMakeLists.txt
-```
-
-## Запуск готовой сборки
-
-Нужны: `gandon_gui.exe`, `capstone.dll` рядом с ним, папка
-`plugins\python` (встроенная Python-консоль), и опционально Python в
-PATH. Папка `signatures\*.pat` рядом с exe — для FLIRT-сигнатур.
+Use CMake 3.21+ and MSVC x64; enable `GANDON_FETCH_UNICORN=ON` for the engine.
+Supply Capstone headers/library under `cpp/third_party/capstone` or via vcpkg.
+The optional driver has its own `cpp/kernel/build-driver.ps1` script and is not rebuilt by the GUI target.

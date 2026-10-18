@@ -1,1 +1,4 @@
 1 ICON "../assets/gandon.ico"
+
+// Explicit UAC manifest, shared by MSVC and MinGW builds.
+1 24 "gandon_gui.manifest"

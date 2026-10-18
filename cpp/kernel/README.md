@@ -1,0 +1,1 @@
+GandonMemory is an optional x64 read-only transport. Source is gandon_memory.c; shared protocol is ../include/gandon/kernel_protocol.h. Build separately with build-driver.ps1 and a WDK root. See out/TEST-SIGNING.md for development loading requirements. No private key is included.

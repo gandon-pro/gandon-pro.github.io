@@ -12,3 +12,10 @@ cpp/third_party/
 
 server_token.txt
 *.token
+
+# Private signing material must never be published.
+*.pfx
+*.pvk
+*.pem
+*.key
+*.obj

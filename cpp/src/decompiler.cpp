@@ -6,6 +6,7 @@
 // continue, goto only as a last resort) -> C-like text.
 #include "gandon/decompiler.hpp"
 #include "gandon/image_tables.hpp"
+#include "gandon/stack_frame.hpp"
 
 #include <algorithm>
 #include <array>
@@ -318,6 +319,7 @@ std::optional<RegRef> parse_register(const std::string& raw) {
         for (int i = 0; i < 16; ++i) {
             m["xmm" + std::to_string(i)] = {kXmmBase + i, 16, false};
             m["ymm" + std::to_string(i)] = {kXmmBase + i, 32, false};
+            m["zmm" + std::to_string(i)] = {kXmmBase + i, 64, false};  // AVX-512 (low 16 vector regs)
         }
         return m;
     }();
@@ -373,7 +375,8 @@ Operand parse_operand(const std::string& text_in) {
         std::string prefix = text.substr(0, bracket);
         const auto colon = prefix.find(':');
         if (colon != std::string::npos) { op.mem.segment = trim(prefix.substr(prefix.rfind(' ', colon) == std::string::npos ? 0 : prefix.rfind(' ', colon) + 1, colon - (prefix.rfind(' ', colon) == std::string::npos ? 0 : prefix.rfind(' ', colon) + 1))); prefix = prefix.substr(0, colon); }
-        if (prefix.find("xmmword") != std::string::npos) op.mem.size = 16;
+        if (prefix.find("zmmword") != std::string::npos) op.mem.size = 64;
+        else if (prefix.find("xmmword") != std::string::npos) op.mem.size = 16;
         else if (prefix.find("ymmword") != std::string::npos) op.mem.size = 32;
         else if (prefix.find("qword") != std::string::npos) op.mem.size = 8;
         else if (prefix.find("dword") != std::string::npos) op.mem.size = 4;
@@ -692,6 +695,96 @@ const std::map<std::string, int>& known_arg_counts() {
         {"RegOpenKeyExA", 5}, {"RegOpenKeyExW", 5}, {"RegCloseKey", 1}, {"WSAStartup", 2}, {"socket", 3}, {"connect", 3},
         {"send", 4}, {"recv", 4}, {"closesocket", 1}, {"__stack_chk_fail", 0}, {"_CxxThrowException", 2}};
     return table;
+}
+
+// ---------------------------------------------------------------------------
+// Known API prototypes: return type + ordered parameter types. These drive
+// typed argument casts and typed result locals in the pseudocode so that calls
+// into the C runtime and Win32 read the way a reverse engineer expects, e.g.
+//   v3 = CreateFileW((LPCWSTR)a1, 0x80000000, 1u, 0, 3, 0x80, 0);
+// The strings are rendered verbatim, matching the Windows SDK / Hex-Rays names.
+struct ApiProto {
+    const char* ret;
+    std::vector<const char*> params;
+};
+
+const std::unordered_map<std::string, ApiProto>& api_prototypes() {
+    static const std::unordered_map<std::string, ApiProto> table{
+        // C runtime
+        {"malloc", {"void*", {"size_t"}}}, {"calloc", {"void*", {"size_t", "size_t"}}},
+        {"realloc", {"void*", {"void*", "size_t"}}}, {"free", {"void", {"void*"}}},
+        {"memcpy", {"void*", {"void*", "const void*", "size_t"}}},
+        {"memmove", {"void*", {"void*", "const void*", "size_t"}}},
+        {"memset", {"void*", {"void*", "int", "size_t"}}},
+        {"memcmp", {"int", {"const void*", "const void*", "size_t"}}},
+        {"strlen", {"size_t", {"const char*"}}}, {"strcmp", {"int", {"const char*", "const char*"}}},
+        {"strncmp", {"int", {"const char*", "const char*", "size_t"}}},
+        {"strcpy", {"char*", {"char*", "const char*"}}},
+        {"strncpy", {"char*", {"char*", "const char*", "size_t"}}},
+        {"strcat", {"char*", {"char*", "const char*"}}}, {"strchr", {"char*", {"const char*", "int"}}},
+        {"strstr", {"char*", {"const char*", "const char*"}}}, {"atoi", {"int", {"const char*"}}},
+        {"puts", {"int", {"const char*"}}}, {"getenv", {"char*", {"const char*"}}},
+        {"fopen", {"FILE*", {"const char*", "const char*"}}}, {"fclose", {"int", {"FILE*"}}},
+        {"fread", {"size_t", {"void*", "size_t", "size_t", "FILE*"}}},
+        {"fwrite", {"size_t", {"const void*", "size_t", "size_t", "FILE*"}}},
+        {"fgets", {"char*", {"char*", "int", "FILE*"}}}, {"fputs", {"int", {"const char*", "FILE*"}}},
+        // Win32 — modules, process, memory
+        {"GetModuleHandleA", {"HMODULE", {"LPCSTR"}}}, {"GetModuleHandleW", {"HMODULE", {"LPCWSTR"}}},
+        {"LoadLibraryA", {"HMODULE", {"LPCSTR"}}}, {"LoadLibraryW", {"HMODULE", {"LPCWSTR"}}},
+        {"FreeLibrary", {"BOOL", {"HMODULE"}}}, {"GetProcAddress", {"FARPROC", {"HMODULE", "LPCSTR"}}},
+        {"GetLastError", {"DWORD", {}}}, {"SetLastError", {"void", {"DWORD"}}},
+        {"GetProcessHeap", {"HANDLE", {}}}, {"HeapAlloc", {"LPVOID", {"HANDLE", "DWORD", "SIZE_T"}}},
+        {"HeapFree", {"BOOL", {"HANDLE", "DWORD", "LPVOID"}}},
+        {"VirtualAlloc", {"LPVOID", {"LPVOID", "SIZE_T", "DWORD", "DWORD"}}},
+        {"VirtualFree", {"BOOL", {"LPVOID", "SIZE_T", "DWORD"}}},
+        {"VirtualProtect", {"BOOL", {"LPVOID", "SIZE_T", "DWORD", "PDWORD"}}},
+        {"GetCurrentProcess", {"HANDLE", {}}}, {"GetCurrentProcessId", {"DWORD", {}}},
+        {"GetCurrentThreadId", {"DWORD", {}}}, {"IsDebuggerPresent", {"BOOL", {}}},
+        {"ExitProcess", {"void", {"UINT"}}}, {"ExitThread", {"void", {"DWORD"}}},
+        {"CloseHandle", {"BOOL", {"HANDLE"}}},
+        {"CreateThread", {"HANDLE", {"LPSECURITY_ATTRIBUTES", "SIZE_T", "LPTHREAD_START_ROUTINE", "LPVOID", "DWORD", "LPDWORD"}}},
+        {"WaitForSingleObject", {"DWORD", {"HANDLE", "DWORD"}}},
+        {"GetTickCount", {"DWORD", {}}}, {"QueryPerformanceCounter", {"BOOL", {"LARGE_INTEGER*"}}},
+        {"Sleep", {"void", {"DWORD"}}},
+        // Win32 — files, console, registry
+        {"CreateFileA", {"HANDLE", {"LPCSTR", "DWORD", "DWORD", "LPSECURITY_ATTRIBUTES", "DWORD", "DWORD", "HANDLE"}}},
+        {"CreateFileW", {"HANDLE", {"LPCWSTR", "DWORD", "DWORD", "LPSECURITY_ATTRIBUTES", "DWORD", "DWORD", "HANDLE"}}},
+        {"ReadFile", {"BOOL", {"HANDLE", "LPVOID", "DWORD", "LPDWORD", "LPOVERLAPPED"}}},
+        {"WriteFile", {"BOOL", {"HANDLE", "LPCVOID", "DWORD", "LPDWORD", "LPOVERLAPPED"}}},
+        {"GetFileSize", {"DWORD", {"HANDLE", "LPDWORD"}}}, {"GetStdHandle", {"HANDLE", {"DWORD"}}},
+        {"WriteConsoleA", {"BOOL", {"HANDLE", "const void*", "DWORD", "LPDWORD", "LPVOID"}}},
+        {"WriteConsoleW", {"BOOL", {"HANDLE", "const void*", "DWORD", "LPDWORD", "LPVOID"}}},
+        {"MessageBoxA", {"int", {"HWND", "LPCSTR", "LPCSTR", "UINT"}}},
+        {"MessageBoxW", {"int", {"HWND", "LPCWSTR", "LPCWSTR", "UINT"}}},
+        {"lstrlenA", {"int", {"LPCSTR"}}}, {"lstrlenW", {"int", {"LPCWSTR"}}},
+        {"RegOpenKeyExA", {"LSTATUS", {"HKEY", "LPCSTR", "DWORD", "REGSAM", "PHKEY"}}},
+        {"RegOpenKeyExW", {"LSTATUS", {"HKEY", "LPCWSTR", "DWORD", "REGSAM", "PHKEY"}}},
+        {"RegCloseKey", {"LSTATUS", {"HKEY"}}},
+        // Winsock
+        {"WSAStartup", {"int", {"WORD", "LPWSADATA"}}}, {"socket", {"SOCKET", {"int", "int", "int"}}},
+        {"connect", {"int", {"SOCKET", "const struct sockaddr*", "int"}}},
+        {"send", {"int", {"SOCKET", "const char*", "int", "int"}}},
+        {"recv", {"int", {"SOCKET", "char*", "int", "int"}}}, {"closesocket", {"int", {"SOCKET"}}},
+        // COM (the XML / imaging DLLs lean on these heavily)
+        {"CoCreateInstance", {"HRESULT", {"REFCLSID", "LPUNKNOWN", "DWORD", "REFIID", "LPVOID*"}}},
+        {"CoInitialize", {"HRESULT", {"LPVOID"}}}, {"CoInitializeEx", {"HRESULT", {"LPVOID", "DWORD"}}},
+        {"CoUninitialize", {"void", {}}}, {"CoTaskMemAlloc", {"LPVOID", {"SIZE_T"}}},
+        {"CoTaskMemFree", {"void", {"LPVOID"}}}, {"SysAllocString", {"BSTR", {"const OLECHAR*"}}},
+        {"SysFreeString", {"void", {"BSTR"}}}, {"SysStringLen", {"UINT", {"BSTR"}}},
+    };
+    return table;
+}
+
+// A type that should be shown as a cast on a (non-constant) argument because it
+// carries meaning a bare integer would not: pointers, handles, string buffers.
+bool is_pointerish_type(const std::string& t) {
+    if (!t.empty() && t.back() == '*') return true;
+    static const std::set<std::string> ptrs{
+        "HANDLE", "HMODULE", "HINSTANCE", "HWND", "HKEY", "HDC", "HGLOBAL", "HLOCAL", "HBITMAP",
+        "HMENU", "HICON", "HBRUSH", "HFONT", "HRGN", "SOCKET", "FARPROC", "LPVOID", "LPCVOID",
+        "LPCSTR", "LPCWSTR", "LPSTR", "LPWSTR", "LPDWORD", "LPWORD", "LPBYTE", "PVOID", "PDWORD",
+        "PHKEY", "BSTR", "LPSECURITY_ATTRIBUTES", "LPOVERLAPPED", "LPWSADATA", "LPTHREAD_START_ROUTINE"};
+    return ptrs.contains(t);
 }
 
 std::string strip_import_decoration(std::string name) {
@@ -1025,14 +1118,20 @@ private:
     }
 
     // ---- calls
-    EP callee_args_call(const std::string& direct_name, const EP& indirect, std::uint32_t arg_mask) {
+    EP callee_args_call(const std::string& direct_name, const EP& indirect, std::uint32_t arg_mask,
+                        std::uint64_t direct_address = 0) {
         const std::vector<int> regs = g_arm ? std::vector<int>{0, 1, 2, 3, 4, 5, 6, 7}
                                             : cx_.options.windows_abi ? std::vector<int>{kRcx, kRdx, 8, 9} : std::vector<int>{kRdi, kRsi, kRdx, kRcx, 8, 9};
         const int register_args = static_cast<int>(regs.size());
         int count = 0;
         const std::string stripped = strip_import_decoration(direct_name);
         const auto known = known_arg_counts().find(stripped);
+        int interprocedural = -1;
+        if (direct_address && cx_.options.arg_count_of) interprocedural = cx_.options.arg_count_of(direct_address);
         if (known != known_arg_counts().end()) count = known->second;
+        else if (const auto proto = api_prototypes().find(stripped); proto != api_prototypes().end())
+            count = static_cast<int>(proto->second.params.size());
+        else if (interprocedural >= 0) count = (std::min)(interprocedural, register_args);
         else {
             for (int i = 0; i < register_args; ++i) if (arg_mask & (1u << regs[i])) count = i + 1;
         }
@@ -1082,12 +1181,16 @@ private:
             const auto n = cx_.options.name_of(slot);
             if (!n.empty()) direct = n;
         }
+        // The stack-cookie check is pure prologue/epilogue bookkeeping that the
+        // compiler inserts; it preserves all registers, so dropping the call keeps
+        // the pseudocode free of `__security_check_cookie(...)` noise.
+        if (!direct.empty() && strip_import_decoration(direct) == "__security_check_cookie") return;
         if (direct.empty()) {
             indirect = target.type == Operand::T::Reg ? read_reg(target.reg)
                      : target.type == Operand::T::Mem ? load(target.mem, 8, next) : konst(0);
         }
         const std::uint32_t mask = defined_since_call_ | block_.arg_mask_in;
-        EP call = callee_args_call(direct, indirect, mask);
+        EP call = callee_args_call(direct, indirect, mask, direct_address);
         if (!direct.empty() && noreturn_names().contains(strip_import_decoration(direct))) noreturn = true;
         if (direct_address && cx_.options.is_noreturn && cx_.options.is_noreturn(direct_address)) noreturn = true;
         const auto result = new_temp(call);
@@ -1385,8 +1488,21 @@ private:
             const bool store_only = m.rfind("stos", 0) == 0;
             const int size = m.back() == 'b' ? 1 : m.back() == 'w' ? 2 : m.back() == 'd' ? 4 : 8;
             const EP count = prefix.empty() ? konst(1) : cur_[kRcx];
-            if (store_only) emit_eval(intrin("__rep_stos" + std::to_string(size), {cur_[kRdi], cur_[kRax], count}));
-            else emit_eval(intrin("__rep_movs" + std::to_string(size), {cur_[kRdi], cur_[kRsi], count}));
+            // Recognise the `rep movs` / `rep stos` block-fill idioms as memcpy/memset
+            // (the length is in bytes = element size * count). Only a REP form that moves
+            // whole bytes, or a zero/byte fill, maps cleanly; otherwise keep the intrinsic.
+            const EP byte_len = size == 1 ? count : bin("*", count, konst(size));
+            if (!store_only && !prefix.empty()) {
+                emit_eval(call_direct("memcpy", {cur_[kRdi], cur_[kRsi], byte_len}));
+            } else if (store_only && !prefix.empty() && size == 1) {
+                emit_eval(call_direct("memset", {cur_[kRdi], bin("&", cur_[kRax], konst(0xFF)), count}));
+            } else if (store_only && !prefix.empty() && is_const(cur_[kRax]) && cur_[kRax]->imm == 0) {
+                emit_eval(call_direct("memset", {cur_[kRdi], konst(0), byte_len}));
+            } else if (store_only) {
+                emit_eval(intrin("__rep_stos" + std::to_string(size), {cur_[kRdi], cur_[kRax], count}));
+            } else {
+                emit_eval(intrin("__rep_movs" + std::to_string(size), {cur_[kRdi], cur_[kRsi], count}));
+            }
             if (!prefix.empty()) { cur_[kRcx] = konst(0); dirty_[kRcx] = true; }
             cur_[kRdi] = intrin("__advance", {cur_[kRdi], count, konst(size)}); dirty_[kRdi] = true;
             if (!store_only) { cur_[kRsi] = intrin("__advance", {cur_[kRsi], count, konst(size)}); dirty_[kRsi] = true; }
@@ -1657,9 +1773,9 @@ private:
         if (it == table.end()) return false;
         const SimdShape shape = it->second.shape;
 
-        // Vector width from the first xmm/ymm operand: 32 -> _mm256_, else _mm_.
+        // Vector width from the first xmm/ymm/zmm operand: 64 -> _mm512_, 32 -> _mm256_, else _mm_.
         int width = 16;
-        for (const auto& o : ops) if (is_xmm_op(o)) { width = o.reg.size >= 32 ? 32 : 16; break; }
+        for (const auto& o : ops) if (is_xmm_op(o)) { width = o.reg.size >= 64 ? 64 : o.reg.size >= 32 ? 32 : 16; break; }
 
         // Zero idiom: pxor/xorps/xorpd with identical source registers -> 0.
         if (base == "pxor" || base == "xorps" || base == "xorpd") {
@@ -1699,8 +1815,8 @@ private:
         } else if (shape == SimdShape::ShiftByte) {
             infix = std::string(infix == "sl" ? "slli" : "srli") + "_si128";
         }
-        std::string name = (width == 32 ? "_mm256_" : "_mm_") + infix;
-        if (width == 32) { const auto p = name.find("si128"); if (p != std::string::npos) name.replace(p, 5, "si256"); }
+        std::string name = (width == 64 ? "_mm512_" : width == 32 ? "_mm256_" : "_mm_") + infix;
+        if (width >= 32) { const auto p = name.find("si128"); if (p != std::string::npos) name.replace(p, 5, width == 64 ? "si512" : "si256"); }
 
         // Read the chosen sources.
         auto read_src = [&](const Operand& o) -> EP {
@@ -1973,7 +2089,7 @@ private:
         else if (reg_target && reg_target->type == ArmOp::T::Reg && !reg_target->zr) indirect = cur_[reg_target->index];
         else indirect = konst(0);
         const std::uint32_t mask = defined_since_call_ | block_.arg_mask_in;
-        EP call = callee_args_call(direct, indirect, mask);
+        EP call = callee_args_call(direct, indirect, mask, direct_address.value_or(0));
         const bool noreturn = (!direct.empty() && noreturn_names().contains(strip_import_decoration(direct))) ||
                               (direct_address && cx_.options.is_noreturn && cx_.options.is_noreturn(*direct_address));
         const auto result = new_temp(call);
@@ -3843,10 +3959,26 @@ public:
         case K::Call: {
             std::string out;
             std::size_t first = 0;
+            const ApiProto* proto = nullptr;
             if (e->imm == 1) { out = "(" + expr(e->a[0], 0) + ")"; first = 1; }
-            else out = strip_import_decoration(e->name);
+            else {
+                out = strip_import_decoration(e->name);
+                if (const auto it = api_prototypes().find(out); it != api_prototypes().end()) proto = &it->second;
+            }
             out += "(";
-            for (std::size_t i = first; i < e->a.size(); ++i) out += (i > first ? ", " : "") + expr(e->a[i]);
+            for (std::size_t i = first; i < e->a.size(); ++i) {
+                std::string arg = expr(e->a[i], 12);
+                // Cast a non-constant argument to a known pointer/handle parameter type so
+                // the call reads like its SDK signature instead of opaque integers.
+                if (proto) {
+                    const std::size_t pi = i - first;
+                    if (pi < proto->params.size() && e->a[i]->kind != K::Const) {
+                        const std::string pt = proto->params[pi];
+                        if (is_pointerish_type(pt) && e->a[i]->kind != K::Cast) arg = "(" + pt + ")" + arg;
+                    }
+                }
+                out += (i > first ? ", " : "") + arg;
+            }
             return out + ")";
         }
         case K::Bin: {
@@ -3875,6 +4007,14 @@ public:
             } else lhs = deref_text(store_fp ? fderef(s.size, s.addr, store_fp) : deref(s.size, s.addr), true);
         } else return expr(s.value) + ";";
         const EP& v = s.value;
+        // Give the destination local the API's return type when it captures a known call,
+        // e.g. `HANDLE v3 = CreateFileW(...);` rather than `int64_t v3 = ...`.
+        if (s.type == Stmt::T::Assign && v->kind == K::Call && v->imm != 1 && lhs.size() >= 2 &&
+            lhs[0] == 'v' && std::isdigit(static_cast<unsigned char>(lhs[1]))) {
+            if (const auto it = api_prototypes().find(strip_import_decoration(v->name));
+                it != api_prototypes().end() && std::string(it->second.ret) != "void")
+                temp_c_type_[lhs] = it->second.ret;
+        }
         if (v->kind == K::Bin) {
             static const std::set<std::string> compound{"+", "-", "*", "&", "|", "^", "<<", ">>"};
             std::string op = v->name; EP rhs = v->a[1];
@@ -3967,7 +4107,11 @@ public:
         std::map<int, std::string> by_number;
         for (const auto& [name, size] : temp_types_) {
             const auto fp = temp_fp_.find(name);
-            by_number[std::stoi(name.substr(1))] = "    " + (fp != temp_fp_.end() && fp->second ? fp_type_name(fp->second) : type_for_size(size ? size : 8)) + " " + name + ";\n";
+            const auto ct = temp_c_type_.find(name);
+            const std::string type = ct != temp_c_type_.end() ? ct->second
+                                   : fp != temp_fp_.end() && fp->second ? fp_type_name(fp->second)
+                                   : type_for_size(size ? size : 8);
+            by_number[std::stoi(name.substr(1))] = "    " + type + " " + name + ";\n";
         }
         for (const auto& [number, line] : by_number) out << line;
         return out.str();
@@ -3978,6 +4122,7 @@ private:
     std::map<std::string, std::string> rename_;
     std::unordered_map<std::string, std::string> temp_names_;
     std::map<std::string, int> temp_types_;
+    std::map<std::string, std::string> temp_c_type_;  // v<N> -> API return type (e.g. "HANDLE")
     std::map<std::string, int> temp_fp_, reg_fp_, frame_fp_;
     std::map<int, std::string> fp_param_;
     std::set<std::string> used_regs_;
@@ -4034,11 +4179,18 @@ DecompileResult decompile_function(const BinaryImage& image, const std::string& 
     std::ostringstream body_text;
     printer.print_seq(body, 1, body_text);
 
+    // A `ret N` (callee stack cleanup) marks a __stdcall function; otherwise the
+    // ABI default applies (MS x64 __fastcall / System V / AArch64).
+    bool callee_cleanup = false;
+    for (const auto& ins : cx.insns)
+        if ((ins.mnemonic == "ret" || ins.mnemonic == "retn") && !ins.operands.empty()) callee_cleanup = true;
+
     std::ostringstream out;
     out << "// " << name << "  @ " << hex(start) << "\n";
     const bool returns_value = cx.saw_return_value;
     const char* return_type = cx.return_fp == 1 ? "float" : cx.return_fp == 2 ? "double" : cx.return_fp == 3 ? "long double" : returns_value ? "int64_t" : "void";
-    out << return_type << (options.windows_abi && !g_arm ? " __fastcall " : " ") << name << "(";
+    const std::string conv = g_arm ? "" : callee_cleanup ? " __stdcall " : options.windows_abi ? " __fastcall " : " ";
+    out << return_type << conv << name << "(";
     for (int i = 1; i <= printer.arg_count(); ++i) {
         const auto sz = cx.param_size.find(i);
         const std::string fp_type = printer.param_fp_type(i);
@@ -4051,6 +4203,14 @@ DecompileResult decompile_function(const BinaryImage& image, const std::string& 
     out << body_text.str();
     out << "}\n";
     result.text = out.str();
+    // Export the recovered signature for interprocedural use and convention display.
+    result.recovered_args = printer.arg_count();
+    result.returns_value = returns_value;
+    result.return_fp = cx.return_fp;
+    result.convention = g_arm ? "AAPCS64"
+                       : callee_cleanup ? "__stdcall"
+                       : options.windows_abi ? "__fastcall"
+                       : "System V";
     result.ok = true;
     return result;
 }
@@ -4097,6 +4257,20 @@ DecompileResult decompile_function_at(const AnalysisDatabase& database, std::uin
     options.name_of = [names = std::move(names), user_names](std::uint64_t a) -> std::string {
         if (user_names) { auto custom = user_names(a); if (!custom.empty()) return custom; }
         const auto it = names.find(a); return it == names.end() ? std::string() : it->second;
+    };
+    // Interprocedural argument counts: a cached, lightweight register-argument scan
+    // of each locally defined callee, so direct calls render with the callee's
+    // real parameter list (item: interprocedural propagation).
+    const bool arm_abi = image.architecture == MachineArchitecture::ARM64;
+    const bool win_abi = options.windows_abi;
+    auto arg_cache = std::make_shared<std::unordered_map<std::uint64_t, int>>();
+    options.arg_count_of = [&database, arg_cache, arm_abi, win_abi](std::uint64_t a) -> int {
+        if (const auto it = arg_cache->find(a); it != arg_cache->end()) return it->second;
+        int recovered = -1;
+        if (const auto f = database.function_at(a); f && f->get().start == a && f->get().instructions.size() > 1)
+            recovered = analyze_stack_frame(f->get(), true, arm_abi, win_abi).reg_args;
+        (*arg_cache)[a] = recovered;
+        return recovered;
     };
     std::string function_name = function->get().name;
     if (user_names) { auto custom = user_names(function->get().start); if (!custom.empty()) function_name = custom; }

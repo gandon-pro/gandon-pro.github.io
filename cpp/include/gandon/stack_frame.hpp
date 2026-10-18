@@ -26,6 +26,7 @@ struct StackFrame {
     Base base{Base::None};
     std::uint64_t alloc{0};         // bytes reserved by the prologue (sub rsp, N)
     int reg_args{0};                // integer register arguments detected (ABI order)
+    std::uint16_t ret_pop{0};       // bytes popped by `ret N` (callee cleanup => __stdcall)
     bool arm64{false};
     std::vector<StackVar> vars;     // offset-sorted (most negative first)
 
@@ -35,6 +36,10 @@ struct StackFrame {
     // or frame-pointer register ("rbp"/"rsp"/"ebp"/"esp"). Returns nullopt when
     // the reference is not a recognisable local/argument slot.
     std::optional<std::string> rename(const std::string& reg, long long signed_disp) const;
+
+    // Calling-convention label: "__fastcall" (MS x64), "__stdcall" (ret N),
+    // "System V" (SysV AMD64) or "AAPCS64" (AArch64).
+    std::string convention(bool windows_abi) const;
 
     // "__int64 __fastcall name(__int64 a1, __int64 a2)" — a best-effort prototype.
     std::string prototype(const std::string& func_name, bool windows_abi) const;

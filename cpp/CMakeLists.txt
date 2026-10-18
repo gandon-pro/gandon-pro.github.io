@@ -70,6 +70,13 @@ add_library(gandon_core STATIC
     src/image_tables.cpp
     src/ida_views.cpp
     src/stack_frame.cpp
+    src/pe_dump.cpp
+    src/vm_analysis.cpp
+    src/dotnet.cpp
+    src/rtti.cpp
+    src/driver.cpp
+    src/live_process.cpp
+    src/live_process_windows.cpp
     src/types.cpp
     src/binary_diff.cpp
     src/auto_analysis.cpp
@@ -127,6 +134,14 @@ add_executable(gandon_mcp_backend src/mcp_backend.cpp)
 target_link_libraries(gandon_mcp_backend PRIVATE gandon_core)
 
 if (BUILD_TESTING)
+    add_executable(gandon_live_process_tests tests/live_process_tests.cpp)
+    target_link_libraries(gandon_live_process_tests PRIVATE gandon_core)
+    if (MSVC)
+        target_compile_options(gandon_live_process_tests PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(gandon_live_process_tests PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME gandon_live_process_tests COMMAND gandon_live_process_tests)
     add_executable(gandon_core_tests tests/core_tests.cpp)
     target_link_libraries(gandon_core_tests PRIVATE gandon_core)
     if (GANDON_CAPSTONE_LIBRARY OR capstone_FOUND OR TARGET capstone::capstone OR TARGET capstone)
@@ -147,6 +162,14 @@ if (BUILD_TESTING)
         target_compile_options(gandon_decompiler_tests PRIVATE /UNDEBUG)
     endif()
     add_test(NAME gandon_decompiler_tests COMMAND gandon_decompiler_tests)
+    add_executable(gandon_unpack_tests tests/unpack_tests.cpp)
+    target_link_libraries(gandon_unpack_tests PRIVATE gandon_core)
+    if (NOT MSVC)
+        target_compile_options(gandon_unpack_tests PRIVATE -UNDEBUG)
+    else()
+        target_compile_options(gandon_unpack_tests PRIVATE /UNDEBUG)
+    endif()
+    add_test(NAME gandon_unpack_tests COMMAND gandon_unpack_tests)
     if (EXISTS "${GANDON_CAPSTONE_ROOT}/lib/capstone.dll")
         add_custom_command(TARGET gandon_core_tests POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -157,8 +180,19 @@ endif()
 
 if (WIN32)
     enable_language(RC)
-    add_executable(gandon_gui WIN32 src/gui_main.cpp src/gandon_gui.rc)
-    target_link_libraries(gandon_gui PRIVATE gandon_core comctl32 comdlg32 user32 gdi32 dwmapi dbghelp)
+    add_executable(gandon_gui WIN32 src/gui_main.cpp src/gandon_gui.rc src/driver_setup.cpp src/gandon_gui.manifest)
+    target_link_libraries(gandon_gui PRIVATE gandon_core comctl32 comdlg32 user32 gdi32 dwmapi dbghelp advapi32 wintrust)
+    if (MSVC)
+        # Resource 1 already embeds the UAC manifest. Avoid a second generated one.
+        target_link_options(gandon_gui PRIVATE /MANIFEST:NO)
+    endif()
+    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/kernel/out/GandonMemory.sys")
+        add_custom_command(TARGET gandon_gui POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:gandon_gui>/drivers"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_CURRENT_SOURCE_DIR}/kernel/out/GandonMemory.sys"
+                "$<TARGET_FILE_DIR:gandon_gui>/drivers/GandonMemory.sys")
+    endif()
     target_compile_definitions(gandon_gui PRIVATE UNICODE _UNICODE)
     if (MINGW)
         target_link_options(gandon_gui PRIVATE -municode)
@@ -197,10 +231,10 @@ if (WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/plugins/python/font_legacy.py"
                 "${CMAKE_CURRENT_SOURCE_DIR}/plugins/python/plugin_window_host.py"
                 "$<TARGET_FILE_DIR:gandon_gui>/plugins/python/plugin_window_host.py")
     endif()
-    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../outputs/gandon_plugins/scyllahide_loader.py")
+    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/plugins/python/scyllahide_loader.py")
         add_custom_command(TARGET gandon_gui POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${CMAKE_CURRENT_SOURCE_DIR}/../outputs/gandon_plugins/scyllahide_loader.py"
+                "${CMAKE_CURRENT_SOURCE_DIR}/plugins/python/scyllahide_loader.py"
                 "$<TARGET_FILE_DIR:gandon_gui>/plugins/python/scyllahide_loader.py")
     endif()
 endif()

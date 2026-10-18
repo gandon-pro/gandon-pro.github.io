@@ -1,3 +1,17 @@
+## 3.2 — live process tools and optional ScyllaHide
+
+- Add cancellable pointer scanning/re-scan and typed/raw structure snapshots.
+- Add reversible native/WOW64 PEB masking and actual anti-debug status reporting.
+- Add an optional read-only, test-signed kernel reader and explicit startup setup dialog.
+- Embed an administrator UAC manifest; leave driver setup optional.
+- Include manually loaded ScyllaHide integration with upstream 1.4 runtime files.
+- Include current decompiler, RTTI, PE dump/IAT and VM-analysis source updates.
+- Fix GUI forward declarations and MSVC command-dispatch nesting errors.
+
+Validation: x64 Release GUI/CLI built; CTest 4/4 passed; separate type tests and CLI/text-view
+smoke checks passed; UAC manifest verified. ScyllaHide injection, interactive GUI operation and
+kernel loading have not been runtime-tested. Test signing is for development; see included guide.
+
 # Changelog
 
 All notable changes to Gandon-PRO are documented in this file.

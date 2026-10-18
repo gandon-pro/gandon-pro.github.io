@@ -5,6 +5,13 @@
 #include "gandon/auto_analysis.hpp"
 #include "gandon/il_emulator.hpp"
 #include "gandon/plugin_host.hpp"
+#include "gandon/pe_dump.hpp"
+#include "gandon/vm_analysis.hpp"
+#include "gandon/dotnet.hpp"
+#include "gandon/rtti.hpp"
+#include "gandon/driver.hpp"
+#include "gandon/live_process.hpp"
+#include "gandon/driver_setup.hpp"
 
 #include <windows.h>
 #include <tlhelp32.h>
@@ -62,6 +69,9 @@ constexpr int ID_JUMP_BACK = 1330, ID_TOGGLE_BOOKMARK = 1331, ID_NEXT_BOOKMARK =
 constexpr int ID_LIST_XREFS = 1336, ID_SEARCH_PROCESS_MEMORY = 1337, ID_FIND_FUNCTION = 1338, ID_HIDE_FUNCTION = 1339;
 constexpr int ID_RUN = 1340, ID_STEP_INTO = 1341, ID_STEP_OVER = 1342, ID_TOGGLE_BP = 1343, ID_COND_BP = 1344, ID_CONFIG_BP = 1345, ID_BP_MANAGER = 1346, ID_HW_BP = 1347, ID_DELETE_BP = 1348, ID_STOP = 1349;
 constexpr int ID_ANTI_DEBUG = 1350;
+constexpr int ID_POINTER_SCAN = 1427, ID_POINTER_RESCAN = 1428, ID_STRUCT_DUMP = 1429;
+constexpr int ID_LIVE_CANCEL = 1430, ID_KERNEL_BACKEND = 1431, ID_ANTIDEBUG_STATUS = 1432, ID_LIVE_EXPORT = 1433;
+constexpr UINT WM_LIVE_RESULT = WM_APP + 56;
 constexpr int ID_TRACE_TOGGLE = 1351, ID_EXPORT_TRACE = 1352, ID_HIDDEN_SYMBOLS = 1353, ID_RESTORE_HIDDEN = 1354;
 constexpr int ID_HIDE_IMPORT = 1355;
 constexpr int ID_MEMORY_SNAPSHOT = 1356, ID_MEMORY_COMPARE = 1357;
@@ -85,6 +95,11 @@ constexpr int ID_VIEW_LLIL = 1398, ID_LLIL_LIFT = 1399, ID_LLIL_STEP = 1400, ID_
 constexpr int ID_LLIL_SET_REGISTER = 1402, ID_LLIL_RESET = 1403;
 constexpr int ID_LLIL_WRITE_MEMORY = 1404;
 constexpr int ID_GRAPH_GROUP = 1411, ID_GRAPH_UNGROUP = 1412, ID_GRAPH_CLEAR_SELECTION = 1413;
+constexpr int ID_INVERT_BRANCH = 1414, ID_FORCE_BRANCH = 1415, ID_NOP_BRANCH = 1416, ID_STUB_RET0 = 1417, ID_STUB_RET1 = 1418;
+constexpr int ID_DUMP_MODULE = 1419, ID_DETECT_VM = 1420, ID_EMULATE_DECRYPT = 1421;
+constexpr int ID_ANALYZE_DOTNET = 1422, ID_TRACE_VM = 1423;
+constexpr int ID_RECOVER_RTTI = 1424, ID_ANALYZE_DRIVER = 1425, ID_DEVIRT_VM = 1426;
+HMENU build_patch_submenu();  // defined with the semantic patch operations below
 constexpr int ID_CONTEXT_FOLLOW = 1390, ID_CONTEXT_COPY = 1391, ID_CONTEXT_FOLLOW_TARGET = 1392;
 constexpr int ID_COLOR_DEFAULT = 1393, ID_COLOR_GREEN = 1394, ID_COLOR_RED = 1395, ID_COLOR_BLUE = 1396;
 constexpr int GRAPH_PAN_PADDING = 100000;
@@ -316,6 +331,144 @@ std::optional<std::uint64_t> editor_line_address(HWND editor);
 void sync_current_address_from_editor();
 void navigate_to_address(HWND window, std::uint64_t address, int tab = 1);
 std::wstring lowered(std::wstring value);
+std::optional<std::wstring> prompt_text(HWND owner, const wchar_t* title, const wchar_t* label, const std::wstring& initial = {}, const wchar_t* hint = L"");
+
+std::string utf8_from_wide(const std::wstring& value);
+struct LiveTaskResult {
+    bool scan{};
+    DWORD pid{};
+    gandon::PointerScanResult pointers;
+    gandon::StructureSnapshot structure;
+    std::string report;
+};
+std::thread g_live_worker;
+std::atomic_bool g_live_cancel{false};
+bool g_live_busy = false, g_live_kernel = false;
+gandon::PointerScanResult g_live_last_scan;
+gandon::StructureSnapshot g_live_last_structure;
+DWORD g_live_last_pid{};
+std::string g_live_last_report;
+
+std::optional<std::uint64_t> live_number(HWND owner, const wchar_t* title, const wchar_t* label, const std::wstring& initial, std::uint64_t maximum) {
+    const auto text = prompt_text(owner, title, label, initial);
+    if (!text) return {};
+    try {
+        const auto first = text->find_first_not_of(L" \t");
+        if (first == std::wstring::npos || (*text)[first] == L'-' || (*text)[first] == L'+') throw std::invalid_argument("number");
+        std::size_t used{}; const auto number = std::stoull(*text, &used, 0);
+        if (text->find_first_not_of(L" \t", used) != std::wstring::npos || number > maximum) throw std::invalid_argument("range");
+        return number;
+    } catch (...) { MessageBoxW(owner, L"Invalid value or range. Use decimal or 0x-prefixed hexadecimal.", title, MB_ICONWARNING); return {}; }
+}
+std::unique_ptr<gandon::LiveMemoryReader> live_reader(HWND window, DWORD& pid) {
+    auto value = live_number(window, L"Live Process", L"Process ID (PID):", std::to_wstring(g_debug_pid.load() ? g_debug_pid.load() : g_live_last_pid), UINT32_MAX);
+    if (!value || !*value) return {};
+    pid = static_cast<DWORD>(*value);
+    std::string error;
+    auto reader = gandon::open_live_process(pid, g_live_kernel, error);
+    if (!reader) MessageBoxW(window, wide(error).c_str(), L"Live Process", MB_ICONWARNING);
+    return reader;
+}
+bool begin_live_job(HWND window, std::function<LiveTaskResult()> job) {
+    if (g_live_busy) { SetWindowTextW(g_status, L"A live operation is running. Use Cancel Live Operation first."); return false; }
+    if (g_live_worker.joinable()) g_live_worker.join();
+    g_live_cancel.store(false); g_live_busy = true;
+    try {
+        g_live_worker = std::thread([window, job = std::move(job)] {
+            auto result = std::make_unique<LiveTaskResult>();
+            try { *result = job(); }
+            catch (const std::exception& e) { result->report = std::string("Live operation failed: ") + e.what(); }
+            catch (...) { result->report = "Live operation failed with an unknown error"; }
+            if (PostMessageW(window, WM_LIVE_RESULT, 0, reinterpret_cast<LPARAM>(result.get()))) result.release();
+        });
+    } catch (...) { g_live_busy = false; SetWindowTextW(g_status, L"Could not create live-operation worker."); return false; }
+    SetWindowTextW(g_status, L"Live operation running; Tools > Cancel Live Operation stops it."); return true;
+}
+void live_pointer_scan(HWND window, bool rescan) {
+    if (g_live_busy) { SetWindowTextW(g_status, L"Cancel or finish the current live operation first."); return; }
+    if (rescan && g_live_last_scan.chains.empty()) { SetWindowTextW(g_status, L"Run Pointer Scan first."); return; }
+    DWORD pid{}; auto reader = live_reader(window, pid); if (!reader) return;
+    std::wostringstream initial;
+    initial << L"0x" << std::hex << (rescan ? g_live_last_scan.chains.front().target : g_debug_pause_address.load());
+    auto target = live_number(window, L"Pointer Scan", L"Target runtime address (not a file VA):", initial.str(), reader->pointer_size() == 4 ? UINT32_MAX : UINT64_MAX);
+    if (!target || !*target) return;
+    gandon::PointerScanOptions options;
+    if (!rescan) {
+        auto depth = live_number(window, L"Pointer Scan", L"Maximum pointer depth (1..10):", L"3", 10);
+        if (!depth || !*depth) return; options.depth = static_cast<unsigned>(*depth);
+        auto offset = live_number(window, L"Pointer Scan", L"Maximum nonnegative offset per hop (0..0x100000):", L"0x1000", 0x100000);
+        if (!offset) return; options.max_offset = *offset;
+        const auto roots = prompt_text(window, L"Pointer Scan", L"Root filter: module (ASLR-friendly module+RVA) or all:", L"module");
+        if (!roots) return;
+        if (*roots == L"all") options.module_roots_only = false;
+        else if (*roots != L"module") { SetWindowTextW(g_status, L"Root filter must be module or all."); return; }
+    }
+    auto shared = std::shared_ptr<gandon::LiveMemoryReader>(std::move(reader));
+    auto previous = g_live_last_scan.chains;
+    begin_live_job(window, [shared, pid, target = *target, options, rescan, previous = std::move(previous)] {
+        LiveTaskResult result; result.scan = true; result.pid = pid;
+        if (rescan) {
+            const auto modules = shared->modules();
+            for (auto chain : previous) {
+                if (g_live_cancel.load()) { result.pointers.cancelled = result.pointers.truncated = true; result.pointers.reason = "Cancelled"; break; }
+                if (!chain.module.empty()) {
+                    const auto found = std::find_if(modules.begin(), modules.end(), [&](const auto& module) { return module.name == chain.module && chain.module_offset < module.size; });
+                    if (found == modules.end() || found->base > UINT64_MAX - chain.module_offset) continue;
+                    chain.root = found->base + chain.module_offset;
+                }
+                ++result.pointers.visited_states;
+                if (gandon::resolve_pointer_chain(*shared, chain) == target) { chain.target = target; result.pointers.chains.push_back(std::move(chain)); }
+            }
+        } else result.pointers = gandon::scan_pointers(*shared, target, options, [] { return g_live_cancel.load(); });
+        result.report = "PID " + std::to_string(pid) + (rescan ? " re-scan\n" : "\n") + gandon::format_pointer_scan(result.pointers);
+        return result;
+    });
+}
+void live_structure_dump(HWND window) {
+    if (g_live_busy) { SetWindowTextW(g_status, L"Finish or cancel the live operation first."); return; }
+    DWORD pid{}; auto reader = live_reader(window, pid); if (!reader) return;
+    auto address = live_number(window, L"Structure Dump", L"Runtime address:", L"0x0", reader->pointer_size() == 4 ? UINT32_MAX : UINT64_MAX);
+    if (!address || !*address) return;
+    const auto type = prompt_text(window, L"Structure Dump", L"Struct/union name from Local Types (empty = raw candidates):", L"");
+    if (!type) return;
+    std::size_t size = 256;
+    if (type->empty()) {
+        auto count = live_number(window, L"Structure Dump", L"Byte count (1..1048576):", L"256", 1048576);
+        if (!count || !*count) return; size = static_cast<std::size_t>(*count);
+    }
+    gandon::TypeLibrary types(static_cast<int>(reader->pointer_size())); std::string error;
+    if (!types.parse(gandon::default_type_declarations(), error) || !types.parse(g_type_source, error)) {
+        MessageBoxW(window, wide(error).c_str(), L"Local Types", MB_ICONWARNING); return;
+    }
+    auto shared = std::shared_ptr<gandon::LiveMemoryReader>(std::move(reader));
+    begin_live_job(window, [shared, pid, address = *address, type_name = utf8_from_wide(*type), size, types = std::move(types)] {
+        LiveTaskResult result; result.pid = pid;
+        result.structure = gandon::dump_live_structure(*shared, types, type_name, address, size);
+        result.report = "PID " + std::to_string(pid) + "\n" + (result.structure.error.empty() ? result.structure.report : result.structure.error);
+        return result;
+    });
+}
+void export_live_result(HWND window) {
+    if (g_live_last_report.empty()) { SetWindowTextW(g_status, L"No live result to export."); return; }
+    wchar_t path[MAX_PATH] = L"live-process.txt";
+    OPENFILENAMEW dialog{sizeof(dialog)}; dialog.hwndOwner = window;
+    dialog.lpstrFilter = L"Text report (*.txt)\0*.txt\0All files\0*.*\0"; dialog.lpstrFile = path; dialog.nMaxFile = MAX_PATH;
+    dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST; dialog.lpstrDefExt = L"txt";
+    if (!GetSaveFileNameW(&dialog)) return;
+    try {
+        auto write = [](const std::filesystem::path& target, const char* data, std::size_t size) {
+            std::ofstream out(target, std::ios::binary | std::ios::trunc); out.exceptions(std::ios::failbit | std::ios::badbit);
+            out.write(data, static_cast<std::streamsize>(size)); out.close();
+        };
+        write(path, g_live_last_report.data(), g_live_last_report.size());
+        if (!g_live_last_structure.bytes.empty()) {
+            write(std::wstring(path) + L".bin", reinterpret_cast<const char*>(g_live_last_structure.bytes.data()), g_live_last_structure.bytes.size());
+            write(std::wstring(path) + L".valid.bin", reinterpret_cast<const char*>(g_live_last_structure.valid.data()), g_live_last_structure.valid.size());
+        }
+        SetWindowTextW(g_status, L"Live report exported; structure dumps also include .bin and .valid.bin.");
+    } catch (const std::exception& e) { MessageBoxW(window, wide(e.what()).c_str(), L"Export Live Result", MB_ICONERROR); }
+}
+
 std::optional<std::uint64_t> resolve_jump_target(std::wstring text);
 std::wstring pseudocode_text_at(const gandon::AnalysisDatabase& db, std::uint64_t address);
 std::wstring hex_text(const gandon::BinaryImage& image, std::uint64_t address);
@@ -324,7 +477,6 @@ std::wstring imports_text(const gandon::BinaryImage& image);
 std::wstring exports_text(const gandon::BinaryImage& image);
 std::wstring resources_text(const gandon::BinaryImage& image);
 std::wstring memory_map_text(const gandon::AnalysisDatabase& db);
-std::string utf8_from_wide(const std::wstring& value);
 void refresh_views(HWND window);
 void refresh_after_patch(HWND window);
 bool write_database_file(const std::filesystem::path& file, std::string& error);
@@ -432,7 +584,7 @@ INT_PTR CALLBACK prompt_proc(HWND dialog, UINT message, WPARAM wparam, LPARAM lp
     return FALSE;
 }
 
-std::optional<std::wstring> prompt_text(HWND owner, const wchar_t* title, const wchar_t* label, const std::wstring& initial = {}, const wchar_t* hint = L"") {
+std::optional<std::wstring> prompt_text(HWND owner, const wchar_t* title, const wchar_t* label, const std::wstring& initial, const wchar_t* hint) {
     // Template buffer holds only what was written: header first, then strings and items in order.
     std::vector<BYTE> data(sizeof(DLGTEMPLATE), 0);
     {
@@ -1468,6 +1620,7 @@ void show_graph_context_menu(HWND graph, int client_x, int client_y) {
     SetWindowTextW(g_status, status.str().c_str());
     HMENU context = CreatePopupMenu();
     AppendMenuW(context, MF_STRING, ID_EDIT_INSTRUCTION, L"Patch Instruction...");
+    AppendMenuW(context, MF_POPUP, reinterpret_cast<UINT_PTR>(build_patch_submenu()), L"Patch");
     AppendMenuW(context, MF_STRING, ID_NOP_BLOCK, L"Patch Function (NOP)");
     AppendMenuW(context, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(context, MF_STRING, ID_TOGGLE_BP, L"Toggle Breakpoint");
@@ -4485,15 +4638,67 @@ void search_binary(HWND window) {
     select_view(window, 1);
 }
 
+// Short printable-string preview at a virtual address, or empty when the
+// bytes there are not a clean ASCII string. Used to annotate string xrefs.
+std::wstring xref_string_preview(std::uint64_t va) {
+    if (!g_database) return {};
+    const auto off = g_database->image().va_to_file_offset(va);
+    if (!off) return {};
+    const auto& bytes = g_database->image().bytes;
+    std::wstring out; std::size_t i = *off;
+    for (; i < bytes.size() && out.size() < 40; ++i) {
+        const auto c = bytes[i];
+        if (c == 0) break;
+        if (c < 0x20 || c > 0x7e) return {};
+        out.push_back(static_cast<wchar_t>(c));
+    }
+    if (out.empty()) return {};
+    const bool terminated = i < bytes.size() && bytes[i] == 0;
+    return L"\"" + out + (terminated ? L"\"" : L"...\"");
+}
+
+// A friendly label for a referenced address: custom label, import, function name
+// or a string preview; empty when nothing is known.
+std::wstring xref_symbol(std::uint64_t addr, const std::string& kind) {
+    if (!g_database) return {};
+    if (const auto it = g_custom_labels.find(addr); it != g_custom_labels.end()) return it->second;
+    for (const auto& imp : g_database->image().imports) if (imp.address == addr) return wide(imp.name);
+    if (const auto fn = g_database->function_at(addr); fn && fn->get().start == addr && !fn->get().name.empty())
+        return wide(fn->get().name);
+    if (kind == "string") return xref_string_preview(addr);
+    return {};
+}
+
+// The source site as "function+0xNN".
+std::wstring xref_from_label(std::uint64_t from) {
+    if (!g_database) return {};
+    const auto fn = g_database->function_at(from);
+    if (!fn) return {};
+    std::wstring base = g_custom_labels.contains(fn->get().start) ? g_custom_labels[fn->get().start] : wide(fn->get().name);
+    if (const auto delta = from - fn->get().start) { wchar_t buf[24]; swprintf_s(buf, L"+0x%llX", static_cast<unsigned long long>(delta)); base += buf; }
+    return base;
+}
+
 void list_xrefs(HWND window) {
     if (!g_database || !g_current_address) { MessageBoxW(window, L"Сначала выбери адрес.", L"XREFs", MB_ICONINFORMATION); return; }
     std::wostringstream result;
-    result << L"XREFs for 0x" << std::hex << std::uppercase << g_current_address << L"\r\n\r\nFrom                    To                      Type\r\n";
+    const auto target_name = xref_symbol(g_current_address, "");
+    result << L"XREFs for 0x" << std::hex << std::uppercase << g_current_address;
+    if (!target_name.empty()) result << L"  (" << target_name << L")";
+    result << L"\r\n\r\nFrom                          To                      Type\r\n";
     const auto references = g_database->xrefs_at(g_current_address);
     std::size_t count = 0;
     for (const auto& reference : references) {
         const auto& xref = reference.get();
-        result << L"0x" << std::hex << std::uppercase << xref.from << L"              0x" << xref.to << L"              " << wide(xref.kind) << L"\r\n";
+        std::wstring from_text = xref_from_label(xref.from);
+        std::wostringstream from_cell; from_cell << L"0x" << std::hex << std::uppercase << xref.from;
+        if (!from_text.empty()) from_cell << L" " << from_text;
+        std::wstring from_str = from_cell.str();
+        if (from_str.size() < 30) from_str.append(30 - from_str.size(), L' ');
+        const auto to_name = xref_symbol(xref.to, xref.kind);
+        result << from_str << L"0x" << std::hex << std::uppercase << xref.to << L"  " << wide(xref.kind);
+        if (!to_name.empty()) result << L"  " << to_name;
+        result << L"\r\n";
         ++count;
     }
     if (!count) result << L"No references found.\r\n";
@@ -4848,6 +5053,122 @@ void edit_instruction(HWND window) {
     if (!offset || !g_database->patch_bytes(g_current_address, replacement, original_bytes, error)) { MessageBoxW(window, wide(error).c_str(), L"Patch Instruction", MB_ICONERROR); return; }
     std::vector<PatchChange> changes; for (std::size_t i = 0; i < replacement.size(); ++i) if (replacement[i] != original_bytes[i]) changes.push_back({*offset + i, original_bytes[i], replacement[i]});
     if (!changes.empty()) { g_patch_undo.push_back(std::move(changes)); g_patch_redo.clear(); g_timeline.push_back('p'); g_timeline_redo.clear(); refresh_after_patch(window); SetWindowTextW(g_status, L"Instruction patched. Undo with Ctrl+Z."); }
+}
+
+// ---------------------------------------------------------------------------
+// One-click semantic patches (no assembly typing): the operations a reverse
+// engineer reaches for constantly — flip/force/kill a branch, stub a function
+// to return 0 or 1. Each goes through the normal patch_bytes + undo pipeline.
+// ---------------------------------------------------------------------------
+std::optional<gandon::Instruction> instruction_at_cursor() {
+    if (!g_database || !g_current_address) return std::nullopt;
+    const auto decoded = gandon::decode_x64(g_database->image(), g_current_address, 1);
+    if (decoded.empty() || decoded.front().size == 0) return std::nullopt;
+    return decoded.front();
+}
+
+bool apply_semantic_patch(HWND window, std::uint64_t address, const std::vector<std::uint8_t>& replacement,
+                          const wchar_t* title, const wchar_t* ok_status) {
+    if (!g_database) return false;
+    std::vector<std::uint8_t> original; std::string error;
+    const auto offset = g_database->image().va_to_file_offset(address);
+    if (!offset || !g_database->patch_bytes(address, replacement, original, error)) {
+        MessageBoxW(window, wide(error.empty() ? std::string("Патч не применён (адрес не в файле?).") : error).c_str(), title, MB_ICONERROR);
+        return false;
+    }
+    std::vector<PatchChange> changes;
+    for (std::size_t i = 0; i < replacement.size(); ++i)
+        if (replacement[i] != original[i]) changes.push_back({*offset + i, original[i], replacement[i]});
+    if (changes.empty()) { SetWindowTextW(g_status, L"Нет изменений: байты уже такие."); return false; }
+    g_patch_undo.push_back(std::move(changes)); g_patch_redo.clear(); g_timeline.push_back('p'); g_timeline_redo.clear();
+    refresh_after_patch(window); SetWindowTextW(g_status, ok_status);
+    return true;
+}
+
+// A conditional Jcc is either a 2-byte short form (0x70..0x7F) or a 6-byte near
+// form (0x0F 0x80..0x8F). Reports which, so the branch ops can rewrite it.
+bool classify_conditional_jump(const gandon::Instruction& ins, bool& is_short) {
+    if (ins.size == 2 && ins.bytes[0] >= 0x70 && ins.bytes[0] <= 0x7F) { is_short = true; return true; }
+    if (ins.size == 6 && ins.bytes[0] == 0x0F && ins.bytes[1] >= 0x80 && ins.bytes[1] <= 0x8F) { is_short = false; return true; }
+    return false;
+}
+
+void invert_branch(HWND window) {
+    const auto ins = instruction_at_cursor();
+    if (!ins) { MessageBoxW(window, L"Сначала выбери инструкцию.", L"Invert Jump", MB_ICONINFORMATION); return; }
+    bool is_short = false;
+    if (!classify_conditional_jump(*ins, is_short)) {
+        MessageBoxW(window, L"Это не условный переход (je/jne/jl/jg/...).", L"Invert Jump", MB_ICONINFORMATION); return;
+    }
+    // The low bit of the condition code selects the opposite predicate (je<->jne, jb<->jae, ...).
+    std::vector<std::uint8_t> rep(ins->bytes.begin(), ins->bytes.begin() + ins->size);
+    if (is_short) rep[0] ^= 0x01; else rep[1] ^= 0x01;
+    apply_semantic_patch(window, g_current_address, rep, L"Invert Jump", L"Условие перехода инвертировано. Ctrl+Z — отмена.");
+}
+
+void force_branch(HWND window) {
+    const auto ins = instruction_at_cursor();
+    if (!ins) { MessageBoxW(window, L"Сначала выбери инструкцию.", L"Force Jump", MB_ICONINFORMATION); return; }
+    bool is_short = false;
+    if (!classify_conditional_jump(*ins, is_short)) {
+        MessageBoxW(window, L"Это не условный переход — форсировать нечего.", L"Force Jump", MB_ICONINFORMATION); return;
+    }
+    std::vector<std::uint8_t> rep;
+    if (is_short) {
+        rep = {0xEB, ins->bytes[1]};               // jcc rel8 -> jmp short rel8 (same displacement)
+    } else {
+        // jcc rel32 (6 bytes) -> jmp rel32 (5 bytes) + NOP. The displacement is measured
+        // from the end of the instruction, which moves back one byte, so add 1.
+        std::int32_t rel = static_cast<std::int32_t>(ins->bytes[2] | (ins->bytes[3] << 8) |
+                                                     (ins->bytes[4] << 16) | (ins->bytes[5] << 24));
+        const std::int32_t adjusted = rel + 1;
+        rep = {0xE9, static_cast<std::uint8_t>(adjusted), static_cast<std::uint8_t>(adjusted >> 8),
+               static_cast<std::uint8_t>(adjusted >> 16), static_cast<std::uint8_t>(adjusted >> 24), 0x90};
+    }
+    apply_semantic_patch(window, g_current_address, rep, L"Force Jump", L"Переход сделан безусловным. Ctrl+Z — отмена.");
+}
+
+void never_branch(HWND window) {
+    const auto ins = instruction_at_cursor();
+    if (!ins) { MessageBoxW(window, L"Сначала выбери инструкцию.", L"Never Jump", MB_ICONINFORMATION); return; }
+    bool is_short = false;
+    if (!classify_conditional_jump(*ins, is_short)) {
+        MessageBoxW(window, L"Это не условный переход — убирать нечего.", L"Never Jump", MB_ICONINFORMATION); return;
+    }
+    std::vector<std::uint8_t> rep(ins->size, 0x90);   // fall through: replace the Jcc with NOPs
+    apply_semantic_patch(window, g_current_address, rep, L"Never Jump", L"Переход вырезан (всегда fall-through). Ctrl+Z — отмена.");
+}
+
+void stub_return(HWND window, bool one) {
+    if (!g_database || !g_current_address) { MessageBoxW(window, L"Сначала выбери адрес функции.", L"Stub Return", MB_ICONINFORMATION); return; }
+    // xor eax,eax; ret  /  mov eax,1; ret
+    std::vector<std::uint8_t> stub = one ? std::vector<std::uint8_t>{0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3}
+                                         : std::vector<std::uint8_t>{0x31, 0xC0, 0xC3};
+    // Pad with NOPs up to the end of whichever instructions the stub overruns, so the
+    // disassembly stays aligned instead of leaving a dangling partial instruction.
+    std::size_t covered = 0; std::uint64_t a = g_current_address;
+    for (int guard = 0; guard < 8 && covered < stub.size(); ++guard) {
+        const auto d = gandon::decode_x64(g_database->image(), a, 1);
+        if (d.empty() || d.front().size == 0) break;
+        covered += d.front().size; a += d.front().size;
+    }
+    std::vector<std::uint8_t> rep = stub;
+    rep.resize((std::max)(stub.size(), covered), 0x90);
+    apply_semantic_patch(window, g_current_address, rep, L"Stub Return",
+                         one ? L"Функция застаблена: return 1. Ctrl+Z — отмена." : L"Функция застаблена: return 0. Ctrl+Z — отмена.");
+}
+
+// Popup with the semantic patch operations, reused by the Edit menu and the
+// disassembly context menus. Ownership transfers to the parent menu.
+HMENU build_patch_submenu() {
+    HMENU patch = CreatePopupMenu();
+    AppendMenuW(patch, MF_STRING, ID_INVERT_BRANCH, L"Invert Jump (je↔jne)");
+    AppendMenuW(patch, MF_STRING, ID_FORCE_BRANCH, L"Force Jump (always)");
+    AppendMenuW(patch, MF_STRING, ID_NOP_BRANCH, L"Never Jump (NOP)");
+    AppendMenuW(patch, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(patch, MF_STRING, ID_STUB_RET0, L"Stub → return 0");
+    AppendMenuW(patch, MF_STRING, ID_STUB_RET1, L"Stub → return 1");
+    return patch;
 }
 
 // ---------------------------------------------------------------------------
@@ -5308,6 +5629,10 @@ const ActionName kActions[] = {
     {"open", ID_OPEN}, {"save_db", ID_SAVE_DB}, {"load_db", ID_LOAD_DB}, {"apply_patches", ID_APPLY_PATCHES}, {"export_graph", ID_EXPORT_GRAPH},
     {"export_json", ID_EXPORT_JSON}, {"export_breakpoints", ID_EXPORT_BREAKPOINTS}, {"export_debug_log", ID_EXPORT_DEBUG_LOG}, {"export_trace", ID_EXPORT_TRACE},
     {"rename", ID_RENAME_LABEL}, {"comment", ID_ADD_COMMENT}, {"assign_type", ID_ASSIGN_TYPE}, {"nop_block", ID_NOP_BLOCK}, {"edit_instruction", ID_EDIT_INSTRUCTION},
+    {"invert_branch", ID_INVERT_BRANCH}, {"force_branch", ID_FORCE_BRANCH}, {"never_branch", ID_NOP_BRANCH}, {"stub_ret0", ID_STUB_RET0}, {"stub_ret1", ID_STUB_RET1},
+    {"dump_module", ID_DUMP_MODULE}, {"detect_vm", ID_DETECT_VM}, {"emulate_decrypt", ID_EMULATE_DECRYPT},
+    {"trace_vm", ID_TRACE_VM}, {"analyze_dotnet", ID_ANALYZE_DOTNET},
+    {"recover_rtti", ID_RECOVER_RTTI}, {"analyze_driver", ID_ANALYZE_DRIVER}, {"devirtualize_vm", ID_DEVIRT_VM},
     {"undo_patch", ID_UNDO_PATCH}, {"redo_patch", ID_REDO_PATCH},
     {"jump_dialog", ID_JUMP_ADDR}, {"jump_back", ID_JUMP_BACK}, {"bookmark", ID_TOGGLE_BOOKMARK}, {"next_bookmark", ID_NEXT_BOOKMARK}, {"list_xrefs", ID_LIST_XREFS},
     {"find_function", ID_FIND_FUNCTION}, {"call_graph", ID_CALL_GRAPH}, {"find_call_path", ID_PATHFINDER},
@@ -6627,43 +6952,86 @@ bool write_runtime_bytes(HANDLE process, std::uint64_t address, const std::vecto
 
 std::atomic<bool> g_hide_debugger{false};
 
-// Clears PEB.BeingDebugged and the debug bits of NtGlobalFlag in the target so that
-// IsDebuggerPresent() and the common PEB checks no longer see the debugger.
+struct SavedPebFlags { std::uint64_t address{}; unsigned flag_offset{}; BYTE being_debugged{}; DWORD flags{}; };
+std::mutex g_peb_mutex;
+std::map<DWORD, std::vector<SavedPebFlags>> g_saved_pebs;
+
+// PEB offsets are undocumented Windows implementation details. No heap flags,
+// kernel debug objects, system callbacks or executable API code are patched.
 bool hide_debugger_in_process(HANDLE process) {
-    using NtQueryInformationProcessFn = LONG (NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
-    const auto query = reinterpret_cast<NtQueryInformationProcessFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
+    using Query = LONG (NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    const auto query = reinterpret_cast<Query>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
     if (!process || !query) return false;
-    BOOL wow64 = FALSE; IsWow64Process(process, &wow64);
-    std::uint64_t peb = 0; std::uint64_t flag_offset = 0xBC;
-    if (wow64) {
-        ULONG_PTR peb32 = 0;
-        if (query(process, 26 /* ProcessWow64Information */, &peb32, sizeof(peb32), nullptr) != 0 || !peb32) return false;
-        peb = peb32; flag_offset = 0x68;
-    } else {
-        struct { PVOID reserved1; PVOID peb_base; PVOID reserved2[2]; ULONG_PTR pid; PVOID reserved3; } basic{};
-        if (query(process, 0 /* ProcessBasicInformation */, &basic, sizeof(basic), nullptr) != 0 || !basic.peb_base) return false;
-        peb = reinterpret_cast<std::uint64_t>(basic.peb_base);
+    const DWORD pid = GetProcessId(process);
+    BOOL wow64 = FALSE;
+    if (!pid || !IsWow64Process(process, &wow64)) return false;
+    SYSTEM_INFO system{}; GetNativeSystemInfo(&system);
+    const bool native64 = system.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64;
+    if (system.wProcessorArchitecture != PROCESSOR_ARCHITECTURE_AMD64 && system.wProcessorArchitecture != PROCESSOR_ARCHITECTURE_INTEL) return false;
+    if (sizeof(void*) == 4 && native64 && !wow64) return false;
+    struct Basic { PVOID reserved; PVOID peb; PVOID reserved2[2]; ULONG_PTR pid; PVOID reserved3; } basic{};
+    if (query(process, 0, &basic, sizeof(basic), nullptr) < 0 || !basic.peb) return false;
+    std::vector<SavedPebFlags> pebs;
+    pebs.push_back({reinterpret_cast<std::uintptr_t>(basic.peb), sizeof(void*) == 8 && native64 ? 0xBCu : 0x68u, 0, 0});
+    if (sizeof(void*) == 8 && wow64) {
+        ULONG_PTR peb32{};
+        if (query(process, 26, &peb32, sizeof(peb32), nullptr) < 0 || !peb32) return false;
+        pebs.push_back({peb32, 0x68, 0, 0});
     }
-    SIZE_T transferred = 0; const BYTE zero = 0;
-    if (!WriteProcessMemory(process, reinterpret_cast<LPVOID>(peb + 2), &zero, 1, &transferred)) return false;
-    DWORD flags = 0;
-    if (ReadProcessMemory(process, reinterpret_cast<LPCVOID>(peb + flag_offset), &flags, sizeof(flags), &transferred)) {
-        flags &= ~0x70u;
-        WriteProcessMemory(process, reinterpret_cast<LPVOID>(peb + flag_offset), &flags, sizeof(flags), &transferred);
+    std::lock_guard lock(g_peb_mutex);
+    if (g_saved_pebs.contains(pid)) return true;
+    for (auto& peb : pebs) {
+        SIZE_T count{};
+        if (!ReadProcessMemory(process, reinterpret_cast<LPCVOID>(peb.address + 2), &peb.being_debugged, 1, &count) || count != 1 ||
+            !ReadProcessMemory(process, reinterpret_cast<LPCVOID>(peb.address + peb.flag_offset), &peb.flags, sizeof(peb.flags), &count) || count != sizeof(peb.flags)) return false;
     }
-    return true;
+    bool ok = true;
+    for (const auto& peb : pebs) {
+        const BYTE zero = 0; const DWORD flags = peb.flags & ~0x70u; SIZE_T count{};
+        if (!WriteProcessMemory(process, reinterpret_cast<LPVOID>(peb.address + 2), &zero, 1, &count) || count != 1 ||
+            !WriteProcessMemory(process, reinterpret_cast<LPVOID>(peb.address + peb.flag_offset), &flags, sizeof(flags), &count) || count != sizeof(flags)) { ok = false; break; }
+        BYTE verified_byte = 1; DWORD verified_flags{};
+        if (!ReadProcessMemory(process, reinterpret_cast<LPCVOID>(peb.address + 2), &verified_byte, 1, &count) || count != 1 || verified_byte != 0 ||
+            !ReadProcessMemory(process, reinterpret_cast<LPCVOID>(peb.address + peb.flag_offset), &verified_flags, sizeof(verified_flags), &count) || count != sizeof(verified_flags) || verified_flags != flags) { ok = false; break; }
+    }
+    if (!ok) {
+        // Roll back both PEBs if one write/verification failed.
+        for (const auto& peb : pebs) {
+            SIZE_T count{};
+            WriteProcessMemory(process, reinterpret_cast<LPVOID>(peb.address + 2), &peb.being_debugged, 1, &count);
+            WriteProcessMemory(process, reinterpret_cast<LPVOID>(peb.address + peb.flag_offset), &peb.flags, sizeof(peb.flags), &count);
+        }
+        return false;
+    }
+    g_saved_pebs.emplace(pid, std::move(pebs)); return true;
+}
+
+bool restore_debugger_pebs(HANDLE process) {
+    std::lock_guard lock(g_peb_mutex);
+    const auto it = g_saved_pebs.find(GetProcessId(process));
+    if (it == g_saved_pebs.end()) return true;
+    bool ok = true;
+    for (const auto& peb : it->second) {
+        SIZE_T count{}; DWORD flags{};
+        if (!ReadProcessMemory(process, reinterpret_cast<LPCVOID>(peb.address + peb.flag_offset), &flags, sizeof(flags), &count) || count != sizeof(flags)) { ok = false; continue; }
+        flags = (flags & ~0x70u) | (peb.flags & 0x70u);
+        if (!WriteProcessMemory(process, reinterpret_cast<LPVOID>(peb.address + 2), &peb.being_debugged, 1, &count) || count != 1 ||
+            !WriteProcessMemory(process, reinterpret_cast<LPVOID>(peb.address + peb.flag_offset), &flags, sizeof(flags), &count) || count != sizeof(flags)) ok = false;
+    }
+    if (ok) g_saved_pebs.erase(it);
+    return ok;
 }
 
 void toggle_hide_debugger(HWND window) {
+    const auto process = g_debug_process.load();
+    if (process && !g_debug_paused.load()) { SetWindowTextW(g_status, L"Pause the debuggee before changing anti-anti-debug settings."); return; }
     const bool enable = !g_hide_debugger.load();
-    g_hide_debugger.store(enable);
-    CheckMenuItem(GetMenu(window), ID_ANTI_DEBUG, MF_BYCOMMAND | (enable ? MF_CHECKED : MF_UNCHECKED));
-    std::wstring message = enable ? L"Hide debugger: ON" : L"Hide debugger: OFF";
-    if (enable) {
-        if (const auto process = g_debug_process.load()) message += hide_debugger_in_process(process) ? L" (applied to the running process)" : L" (could not patch the running process)";
-        else message += L" (applies to the next debug session)";
+    if (process && !(enable ? hide_debugger_in_process(process) : restore_debugger_pebs(process))) {
+        SetWindowTextW(g_status, L"PEB update failed; settings were not changed."); return;
     }
-    SetWindowTextW(g_status, message.c_str());
+    g_hide_debugger.store(enable); g_stealth_applied.store(enable && process);
+    CheckMenuItem(GetMenu(window), ID_ANTI_DEBUG, MF_BYCOMMAND | (enable ? MF_CHECKED : MF_UNCHECKED));
+    SetWindowTextW(g_status, enable ? L"PEB anti-anti-debug ON (native/WOW64). Kernel debug state remains visible." : L"PEB anti-anti-debug OFF; saved PEB flags restored.");
 }
 
 void install_requested_import_disables(HANDLE process, std::uint64_t module_base) {
@@ -6739,110 +7107,23 @@ void toggle_import_disable(HWND window, std::uint64_t iat_va) {
     (void)window;
 }
 
-std::optional<std::uint64_t> remote_module_base(DWORD pid, const std::wstring& module_name) {
-    const auto snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
-    if (snapshot == INVALID_HANDLE_VALUE) return std::nullopt;
-    MODULEENTRY32W entry{};
-    entry.dwSize = sizeof(entry);
-    std::optional<std::uint64_t> result;
-    if (Module32FirstW(snapshot, &entry)) {
-        do {
-            if (_wcsicmp(entry.szModule, module_name.c_str()) == 0) {
-                result = reinterpret_cast<std::uint64_t>(entry.modBaseAddr);
-                break;
-            }
-        } while (Module32NextW(snapshot, &entry));
-    }
-    CloseHandle(snapshot);
-    return result;
-}
-
-bool patch_remote_export(HANDLE process, DWORD pid, const std::wstring& module_name,
-                         const char* export_name, const std::vector<std::uint8_t>& patch) {
-    if (!process || patch.empty()) return false;
-    const auto local_module = GetModuleHandleW(module_name.c_str());
-    if (!local_module) return false;
-    const auto local_export = GetProcAddress(local_module, export_name);
-    const auto remote_module = remote_module_base(pid, module_name);
-    if (!local_export || !remote_module) return false;
-    const auto local_rva = reinterpret_cast<std::uintptr_t>(local_export) - reinterpret_cast<std::uintptr_t>(local_module);
-    const auto remote_address = *remote_module + local_rva;
-    DWORD old_protection{};
-    if (!VirtualProtectEx(process, reinterpret_cast<LPVOID>(remote_address), patch.size(), PAGE_EXECUTE_READWRITE, &old_protection)) return false;
-    bool success = false;
-    SIZE_T written{};
-    if (WriteProcessMemory(process, reinterpret_cast<LPVOID>(remote_address), patch.data(), patch.size(), &written) && written == patch.size()) {
-        FlushInstructionCache(process, reinterpret_cast<LPCVOID>(remote_address), patch.size());
-        std::vector<std::uint8_t> verify(patch.size());
-        SIZE_T read{};
-        success = ReadProcessMemory(process, reinterpret_cast<LPCVOID>(remote_address), verify.data(), verify.size(), &read) &&
-                  read == verify.size() && verify == patch;
-    }
-    VirtualProtectEx(process, reinterpret_cast<LPVOID>(remote_address), patch.size(), old_protection, &old_protection);
-    return success;
-}
-
-struct NativeProcessBasicInformation {
-    PVOID reserved1{};
-    PVOID peb_address{};
-    PVOID reserved2[2]{};
-    ULONG_PTR unique_process_id{};
-    PVOID reserved3{};
-};
-
-std::pair<int, std::wstring> apply_stealth_to_process(HANDLE process, DWORD pid, bool target_is_64) {
-    if (!process || !pid) return {0, L"Target process is not running."};
-    int patched = 0;
-    std::vector<std::wstring> details;
-    const auto ntdll = GetModuleHandleW(L"ntdll.dll");
-    using NtQueryInformationProcessFn = LONG (NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
-    const auto query_process = ntdll ? reinterpret_cast<NtQueryInformationProcessFn>(GetProcAddress(ntdll, "NtQueryInformationProcess")) : nullptr;
-    if (query_process) {
-        NativeProcessBasicInformation information{};
-        ULONG returned{};
-        if (query_process(process, 0, &information, sizeof(information), &returned) == 0 && information.peb_address) {
-            const auto peb = reinterpret_cast<std::uintptr_t>(information.peb_address);
-            std::uint8_t zero_byte = 0;
-            DWORD zero_flag = 0;
-            SIZE_T written{};
-            bool being_debugged = WriteProcessMemory(process, reinterpret_cast<LPVOID>(peb + 2), &zero_byte, sizeof(zero_byte), &written) && written == sizeof(zero_byte);
-            written = 0;
-            const auto nt_global_flag_offset = target_is_64 ? 0xBCu : 0x68u;
-            bool global_flag = WriteProcessMemory(process, reinterpret_cast<LPVOID>(peb + nt_global_flag_offset), &zero_flag, sizeof(zero_flag), &written) && written == sizeof(zero_flag);
-            if (being_debugged) details.push_back(L"PEB.BeingDebugged=0");
-            if (global_flag) details.push_back(L"PEB.NtGlobalFlag=0");
-        }
-    }
-    const std::vector<std::uint8_t> is_debugger_present = {0x31, 0xC0, 0xC3};
-    for (const auto& module : {std::wstring(L"kernel32.dll"), std::wstring(L"kernelbase.dll")})
-        if (patch_remote_export(process, pid, module, "IsDebuggerPresent", is_debugger_present)) ++patched;
-    const std::vector<std::uint8_t> check_remote_debugger = target_is_64
-        ? std::vector<std::uint8_t>{0xC7, 0x02, 0x00, 0x00, 0x00, 0x00, 0xC3}
-        : std::vector<std::uint8_t>{0xC7, 0x44, 0x24, 0x08, 0x00, 0x00, 0x00, 0x00, 0xC2, 0x08, 0x00};
-    for (const auto& module : {std::wstring(L"kernel32.dll"), std::wstring(L"kernelbase.dll")})
-        if (patch_remote_export(process, pid, module, "CheckRemoteDebuggerPresent", check_remote_debugger)) ++patched;
-    if (patched || !details.empty()) {
-        std::wostringstream message;
-        message << L"Anti-debug bypass: " << patched << L" API hook(s)";
-        if (!details.empty()) { message << L"; "; for (std::size_t index = 0; index < details.size(); ++index) message << (index ? L", " : L"") << details[index]; }
-        return {patched + static_cast<int>(details.size()), message.str()};
-    }
-    return {0, L"Anti-debug bypass could not patch the target (system modules may not be loaded yet)."};
-}
-
-void apply_antidebug(HWND window) {
+void show_antidebug_status(HWND window) {
     const auto process = g_debug_process.load();
-    const auto pid = g_debug_pid.load();
-    if (!process || !pid) {
-        MessageBoxW(window, L"Сначала запусти процесс под отладчиком.", L"Anti-Debug Bypass", MB_ICONINFORMATION);
-        return;
+    if (!process) { SetWindowTextW(g_status, L"No debug process."); return; }
+    std::wostringstream report;
+    report << L"Anti-anti-debug status\r\nPEB profile: " << (g_stealth_applied.load() ? L"applied" : L"not applied")
+           << L"\r\nReversible BeingDebugged and NtGlobalFlag debug-bit masking; native and WOW64 PEBs.\r\n"
+           << L"No API prologue patching. Direct syscalls, debug ports, timing, heap and kernel checks can still detect debugging.\r\n";
+    using Query = LONG (NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    const auto query = reinterpret_cast<Query>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
+    if (query) {
+        ULONG_PTR port{}; ULONG flags{};
+        const auto a = query(process, 7, &port, sizeof(port), nullptr);
+        const auto b = query(process, 31, &flags, sizeof(flags), nullptr);
+        report << L"ProcessDebugPort: status=0x" << std::hex << static_cast<ULONG>(a) << L" value=0x" << port
+               << L"\r\nProcessDebugFlags: status=0x" << static_cast<ULONG>(b) << L" value=0x" << flags << L"\r\n";
     }
-    const bool target_is_64 = !g_database || g_database->image().image_base > 0xffffffffull;
-    const auto result = apply_stealth_to_process(process, pid, target_is_64);
-    if (result.first > 0) g_stealth_applied.store(true);
-    log_debug_event(result.second);
-    SetWindowTextW(g_status, result.second.c_str());
-    MessageBoxW(window, result.second.c_str(), L"Anti-Debug Bypass", result.first > 0 ? MB_ICONINFORMATION : MB_ICONWARNING);
+    g_listing = report.str(); select_view(window, 1);
 }
 
 std::uint64_t context_register_value(const CONTEXT& context, const std::wstring& name, bool& found) {
@@ -6997,7 +7278,10 @@ void debug_loop(HWND window, HANDLE process, DWORD pid) {
             g_debug_base.store(base); g_debug_thread.store(event.dwThreadId);
             install_requested_breakpoints(process, base);
             install_requested_import_disables(process, base);
-            if (g_hide_debugger.load()) log_debug_event(hide_debugger_in_process(process) ? L"Hide debugger: PEB patched" : L"Hide debugger: PEB patch failed");
+            if (g_hide_debugger.load()) {
+                const bool applied = hide_debugger_in_process(process); g_stealth_applied.store(applied);
+                log_debug_event(applied ? L"Anti-anti-debug: PEB flags masked" : L"Anti-anti-debug: PEB masking failed");
+            }
             { std::wostringstream text; text << L"CREATE_PROCESS pid=" << event.dwProcessId << L" base=0x" << std::hex << std::uppercase << base; log_debug_event(text.str()); }
             PostMessageW(window, WM_DEBUG_STATUS, 2, 0);
             if (event.u.CreateProcessInfo.hFile) CloseHandle(event.u.CreateProcessInfo.hFile);
@@ -7115,6 +7399,7 @@ void debug_loop(HWND window, HANDLE process, DWORD pid) {
         if (event.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT) break;
     }
     restore_import_disables(process);
+    { std::lock_guard lock(g_peb_mutex); g_saved_pebs.erase(pid); }
     CloseHandle(process);
     {
         std::lock_guard lock(g_breakpoint_mutex);
@@ -7337,6 +7622,260 @@ bool initialize_emulation_session(HWND window) {
     }
     g_emulator = std::move(session);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Unpacking & protection analysis. These are static/dynamic RE aids for the
+// user's own target: dump an unpacked module, rebuild its imports, locate a VM
+// dispatcher, and run a decryptor to recover plaintext. They do not defeat
+// anti-cheat protections or help build a cheat.
+// ---------------------------------------------------------------------------
+
+// Map every named export of every module loaded in the debugged process to its
+// absolute address, so a dumped IAT of resolved pointers can be named again.
+void collect_remote_exports(HANDLE process, std::map<std::uint64_t, std::string>& out) {
+    if (!process) return;
+    const auto snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, g_debug_pid.load());
+    if (snapshot == INVALID_HANDLE_VALUE) return;
+    const auto rd = [&](std::uint64_t addr, void* dst, std::size_t n) -> bool {
+        SIZE_T got = 0; return ReadProcessMemory(process, reinterpret_cast<LPCVOID>(addr), dst, n, &got) && got == n;
+    };
+    MODULEENTRY32W entry{}; entry.dwSize = sizeof(entry);
+    if (Module32FirstW(snapshot, &entry)) do {
+        const auto base = reinterpret_cast<std::uint64_t>(entry.modBaseAddr);
+        const std::string dll = utf8(entry.szModule);
+        std::uint8_t hdr[0x400];
+        if (!rd(base, hdr, sizeof hdr) || hdr[0] != 'M' || hdr[1] != 'Z') continue;
+        const std::uint32_t pe = *reinterpret_cast<std::uint32_t*>(hdr + 0x3c);
+        if (pe + 0x88 > sizeof hdr || hdr[pe] != 'P' || hdr[pe + 1] != 'E') continue;
+        const bool is64 = *reinterpret_cast<std::uint16_t*>(hdr + pe + 24) == 0x20b;
+        const std::size_t dir = pe + 24 + (is64 ? 112 : 96);           // export directory = data dir 0
+        const std::uint32_t exp_rva = *reinterpret_cast<std::uint32_t*>(hdr + dir);
+        const std::uint32_t exp_size = *reinterpret_cast<std::uint32_t*>(hdr + dir + 4);
+        if (!exp_rva || !exp_size) continue;
+        std::uint8_t ed[40];
+        if (!rd(base + exp_rva, ed, sizeof ed)) continue;
+        const std::uint32_t n_funcs = *reinterpret_cast<std::uint32_t*>(ed + 20);
+        const std::uint32_t n_names = *reinterpret_cast<std::uint32_t*>(ed + 24);
+        const std::uint32_t funcs_rva = *reinterpret_cast<std::uint32_t*>(ed + 28);
+        const std::uint32_t names_rva = *reinterpret_cast<std::uint32_t*>(ed + 32);
+        const std::uint32_t ords_rva = *reinterpret_cast<std::uint32_t*>(ed + 36);
+        if (n_funcs > 200000 || n_names > 200000) continue;
+        std::vector<std::uint32_t> funcs(n_funcs), names(n_names);
+        std::vector<std::uint16_t> ords(n_names);
+        if (n_funcs && !rd(base + funcs_rva, funcs.data(), funcs.size() * 4)) continue;
+        if (n_names && !rd(base + names_rva, names.data(), names.size() * 4)) continue;
+        if (n_names && !rd(base + ords_rva, ords.data(), ords.size() * 2)) continue;
+        for (std::uint32_t i = 0; i < n_names; ++i) {
+            char nm[256]{}; if (!rd(base + names[i], nm, sizeof nm - 1)) continue; nm[255] = 0;
+            if (ords[i] >= n_funcs) continue;
+            const std::uint32_t frva = funcs[ords[i]];
+            if (!frva || (frva >= exp_rva && frva < exp_rva + exp_size)) continue;   // skip empty / forwarders
+            out[base + frva] = dll + "!" + nm;
+        }
+    } while (Module32NextW(snapshot, &entry));
+    CloseHandle(snapshot);
+}
+
+void dump_process_module(HWND window) {
+    const auto process = g_debug_process.load();
+    const auto base = g_debug_base.load();
+    if (!process || !base) { MessageBoxW(window, L"Сначала запусти цель под отладчиком (Run) и поставь на паузу после распаковки.", L"Dump Module", MB_ICONINFORMATION); return; }
+    std::uint8_t hdr[0x1000];
+    SIZE_T got = 0;
+    if (!ReadProcessMemory(process, reinterpret_cast<LPCVOID>(base), hdr, sizeof hdr, &got) || got < 0x400 || hdr[0] != 'M' || hdr[1] != 'Z') {
+        MessageBoxW(window, L"Не удалось прочитать заголовки модуля из процесса.", L"Dump Module", MB_ICONERROR); return;
+    }
+    const std::uint32_t pe = *reinterpret_cast<std::uint32_t*>(hdr + 0x3c);
+    const std::uint32_t size_of_image = *reinterpret_cast<std::uint32_t*>(hdr + pe + 24 + 56);
+    if (!size_of_image || size_of_image > 512u * 1024 * 1024) { MessageBoxW(window, L"Некорректный SizeOfImage в заголовке.", L"Dump Module", MB_ICONERROR); return; }
+    std::vector<std::uint8_t> mem(size_of_image, 0);
+    for (std::uint32_t off = 0; off < size_of_image; off += 0x1000) {
+        SIZE_T n = 0;
+        ReadProcessMemory(process, reinterpret_cast<LPCVOID>(base + off), mem.data() + off,
+                          (std::min<std::uint32_t>)(0x1000, size_of_image - off), &n);  // tolerate unreadable pages
+    }
+    auto dumped = gandon::pe_dump::build_pe_from_memory(mem);
+    if (!dumped.ok) { MessageBoxW(window, wide(dumped.error).c_str(), L"Dump Module", MB_ICONERROR); return; }
+    std::map<std::uint64_t, std::string> exports;
+    collect_remote_exports(process, exports);
+    const auto resolver = [&](std::uint64_t p) -> std::string { const auto it = exports.find(p); return it == exports.end() ? std::string() : it->second; };
+    auto rebuilt = gandon::pe_dump::rebuild_imports(dumped.bytes, base, resolver);
+    const std::vector<std::uint8_t>* final_bytes = &dumped.bytes;
+    std::wstring status;
+    if (rebuilt.ok) { final_bytes = &rebuilt.bytes; status = L"IAT rebuilt: " + std::to_wstring(rebuilt.resolved) + L" import(s) across " + std::to_wstring(rebuilt.dll_count) + L" dll(s)."; }
+    else status = L"Dumped (no IAT rebuild: " + wide(rebuilt.error) + L").";
+    wchar_t file_name[MAX_PATH] = L"dumped.exe";
+    OPENFILENAMEW dlg{sizeof(dlg)}; dlg.hwndOwner = window; dlg.lpstrFilter = L"Executables (*.exe;*.dll)\0*.exe;*.dll\0All files (*.*)\0*.*\0"; dlg.lpstrFile = file_name; dlg.nMaxFile = MAX_PATH; dlg.Flags = OFN_OVERWRITEPROMPT;
+    if (!GetSaveFileNameW(&dlg)) return;
+    std::ofstream out(file_name, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(final_bytes->data()), static_cast<std::streamsize>(final_bytes->size()));
+    if (!out) { MessageBoxW(window, L"Не удалось записать файл.", L"Dump Module", MB_ICONERROR); return; }
+    MessageBoxW(window, (L"Модуль сдамплен (" + std::to_wstring(size_of_image) + L" байт).\r\n" + status).c_str(), L"Dump Module", MB_ICONINFORMATION);
+    SetWindowTextW(g_status, status.c_str());
+}
+
+void detect_vm_here(HWND window) {
+    if (!g_database || !g_current_address) { MessageBoxW(window, L"Выбери функцию.", L"Detect VM", MB_ICONINFORMATION); return; }
+    const auto fn = g_database->function_at(g_current_address);
+    if (!fn) { MessageBoxW(window, L"Текущий адрес вне функции.", L"Detect VM", MB_ICONINFORMATION); return; }
+    const auto vm = gandon::detect_vm_dispatch(g_database->image(), fn->get().start, fn->get().instructions);
+    const auto flat = gandon::detect_flattening(g_database->image(), fn->get().start, fn->get().instructions);
+    std::wostringstream r;
+    r << L"VM / obfuscation scan @ 0x" << std::hex << std::uppercase << fn->get().start << L"\r\n\r\n";
+    r << L"control-flow: " << wide(flat.note) << L"\r\n";
+    if (flat.flattened) r << L"  dispatcher 0x" << flat.dispatcher << L"  in-degree " << std::dec << flat.dispatcher_in_degree << L"\r\n";
+    r << L"\r\n";
+    if (!vm.found) {
+        r << wide(vm.note) << L"\r\n\r\nПримечание: VMProtect/Virbox обычно диспетчеризуют через регистр (jmp rax после вычисления адреса хендлера), это ловится только динамической трассировкой хендлеров, а не статическим сканом таблиц.\r\n";
+    } else {
+        r << L"dispatch site : 0x" << vm.dispatch_site << L"\r\nhandler table : 0x" << vm.table_va << L"  (index*" << std::dec << vm.scale << L")\r\nhandlers      : " << vm.handlers.size() << L"\r\n\r\n";
+        std::size_t i = 0; for (const auto h : vm.handlers) { r << L"  handler[" << std::dec << i << L"] = 0x" << std::hex << std::uppercase << h << L"\r\n"; if (++i >= 64) { r << L"  ... (" << std::dec << (vm.handlers.size() - i) << L" more)\r\n"; break; } }
+    }
+    g_listing = r.str(); select_view(window, 1);
+    SetWindowTextW(g_status, vm.found ? L"VM dispatcher found." : flat.flattened ? L"Control-flow flattening detected." : L"No table-based VM dispatcher here.");
+}
+
+void trace_vm_here(HWND window) {
+    if (!g_database || !g_current_address) { MessageBoxW(window, L"Выбери точку входа VM.", L"Trace VM", MB_ICONINFORMATION); return; }
+    const auto fn = g_database->function_at(g_current_address);
+    const std::uint64_t start = fn ? fn->get().start : g_current_address;
+    const auto& insns = fn ? fn->get().instructions : std::vector<gandon::Instruction>{};
+    const auto vm = gandon::detect_vm_dispatch(g_database->image(), start, insns);
+    if (!vm.found) { MessageBoxW(window, L"В этой функции не найден табличный VM-диспетчер — трассировать нечего.", L"Trace VM", MB_ICONINFORMATION); return; }
+    SetWindowTextW(g_status, L"Emulating VM handler trace...");
+    const auto trace = gandon::trace_vm_handlers(g_database->image(), g_current_address, vm);
+    std::wostringstream r;
+    r << L"VM handler trace from 0x" << std::hex << std::uppercase << g_current_address << L"\r\n\r\n";
+    if (!trace.ok) {
+        r << L"Трассировка не удалась: " << wide(trace.error) << L"\r\n\r\n"
+          << L"Причина обычно в анти-эмуляции/защите (VMProtect/Virbox): эмулятор без реальной ОС и обхода anti-debug не проходит далеко. На простых/кастомных VM работает.\r\n";
+    } else {
+        r << L"handlers executed: " << std::dec << trace.handler_sequence.size() << (trace.truncated ? L" (truncated)" : L"") << L"\r\n\r\n";
+        std::size_t i = 0;
+        for (const auto h : trace.handler_sequence) { r << L"  " << std::dec << i << L": 0x" << std::hex << std::uppercase << h << L"\r\n"; if (++i >= 200) { r << L"  ...\r\n"; break; } }
+    }
+    g_listing = r.str(); select_view(window, 1);
+    SetWindowTextW(g_status, trace.ok ? L"VM handler trace done." : L"VM handler trace failed (protection?).");
+}
+
+void analyze_dotnet_here(HWND window) {
+    if (!g_database) { MessageBoxW(window, L"Сначала открой бинарь.", L"Analyze .NET", MB_ICONINFORMATION); return; }
+    const auto info = gandon::parse_dotnet(g_database->image());
+    std::wostringstream r;
+    if (!info.is_dotnet) { r << L".NET: " << wide(info.error) << L"\r\n"; g_listing = r.str(); select_view(window, 1); SetWindowTextW(g_status, L"Not a .NET assembly."); return; }
+    r << L".NET assembly\r\n  runtime: " << wide(info.runtime_version) << L"\r\n  entry token: 0x" << std::hex << std::uppercase << info.entry_point_token
+      << L"\r\n  IL-only: " << (info.il_only ? L"yes" : L"no") << L"\r\n\r\n  metadata tables:\r\n";
+    for (const auto& [name, rows] : info.table_rows) r << L"    " << wide(name) << L" : " << std::dec << rows << L"\r\n";
+    r << L"\r\n  names (#Strings): " << std::dec << info.names.size() << L", user strings (#US): " << info.user_strings.size() << L"\r\n\r\n";
+    r << L"  user strings:\r\n";
+    std::size_t shown = 0;
+    for (const auto& s : info.user_strings) { r << L"    \"" << wide(s) << L"\"\r\n"; if (++shown >= 200) { r << L"    ... (" << std::dec << (info.user_strings.size() - shown) << L" more)\r\n"; break; } }
+    g_listing = r.str(); select_view(window, 1);
+    SetWindowTextW(g_status, (L".NET: " + std::to_wstring(info.names.size()) + L" names, " + std::to_wstring(info.user_strings.size()) + L" strings.").c_str());
+}
+
+void recover_rtti_here(HWND window) {
+    if (!g_database) { MessageBoxW(window, L"Сначала открой бинарь.", L"RTTI", MB_ICONINFORMATION); return; }
+    const auto classes = gandon::recover_rtti(g_database->image());
+    std::wostringstream r;
+    r << L"MSVC RTTI / C++ classes: " << std::dec << classes.size() << L"\r\n\r\n";
+    if (classes.empty()) r << L"RTTI не найдено (бинарь без RTTI, не-MSVC, или стрипнут).\r\n";
+    for (const auto& c : classes) {
+        r << L"  " << wide(c.name) << L"\r\n      vtable 0x" << std::hex << std::uppercase << c.vtable_va
+          << L"  methods " << std::dec << c.method_count;
+        if (!c.base_classes.empty()) { r << L"  : "; for (std::size_t i = 0; i < c.base_classes.size(); ++i) r << (i ? L", " : L"") << wide(c.base_classes[i]); }
+        r << L"\r\n";
+    }
+    g_listing = r.str(); select_view(window, 1);
+    SetWindowTextW(g_status, (std::to_wstring(classes.size()) + L" RTTI class(es) recovered.").c_str());
+}
+
+void analyze_driver_here(HWND window) {
+    if (!g_database) { MessageBoxW(window, L"Сначала открой бинарь.", L"Driver", MB_ICONINFORMATION); return; }
+    const auto info = gandon::analyze_driver(g_database->image());
+    std::wostringstream r;
+    if (!info.is_driver) { r << L"driver: " << wide(info.error) << L"\r\n"; g_listing = r.str(); select_view(window, 1); SetWindowTextW(g_status, L"Not a kernel driver."); return; }
+    r << L"Kernel driver\r\n  DriverEntry: 0x" << std::hex << std::uppercase << info.driver_entry << L"\r\n\r\n  IRP dispatch routines:\r\n";
+    for (const auto& h : info.handlers) r << L"    " << wide(h.name) << L" -> 0x" << h.handler << L"\r\n";
+    r << L"\r\n  IOCTL codes (" << std::dec << info.ioctls.size() << L"):\r\n";
+    for (const auto c : info.ioctls) { wchar_t buf[16]; swprintf_s(buf, L"0x%08X", c); r << L"    " << buf << L"\r\n"; }
+    g_listing = r.str(); select_view(window, 1);
+    SetWindowTextW(g_status, L"Driver analysis done.");
+}
+
+void devirtualize_vm_here(HWND window) {
+    if (!g_database || !g_current_address) { MessageBoxW(window, L"Выбери функцию с VM.", L"Devirtualize", MB_ICONINFORMATION); return; }
+    const auto fn = g_database->function_at(g_current_address);
+    const std::uint64_t start = fn ? fn->get().start : g_current_address;
+    const auto& insns = fn ? fn->get().instructions : std::vector<gandon::Instruction>{};
+    const auto vm = gandon::detect_vm_dispatch(g_database->image(), start, insns);
+    if (!vm.found) { MessageBoxW(window, L"Табличный VM-диспетчер не найден в этой функции.", L"Devirtualize", MB_ICONINFORMATION); return; }
+    const auto classes = gandon::classify_vm_handlers(g_database->image(), vm);
+    std::wostringstream r;
+    r << L"VM devirtualization (semi-automatic) @ 0x" << std::hex << std::uppercase << start << L"\r\n"
+      << L"handler table 0x" << vm.table_va << L", " << std::dec << vm.handlers.size() << L" handlers\r\n\r\n";
+    std::size_t shown = 0;
+    for (const auto& hc : classes) {
+        r << L"=== handler[" << std::dec << shown << L"] 0x" << std::hex << std::uppercase << hc.address << L"  [" << wide(hc.classification) << L"]\r\n";
+        const auto dr = gandon::decompile_function_at(*g_database, hc.address);
+        if (dr.ok) r << wide(dr.text) << L"\r\n";
+        else r << L"    (decompile: " << wide(dr.error) << L")\r\n";
+        if (++shown >= 24) { r << L"... (" << std::dec << (classes.size() - shown) << L" more handlers)\r\n"; break; }
+    }
+    g_listing = r.str(); select_view(window, 1);
+    SetWindowTextW(g_status, L"VM handlers decompiled.");
+}
+
+// Pull printable ASCII and UTF-16LE strings (>= 4 chars) out of a byte buffer.
+void extract_strings(const std::vector<std::uint8_t>& buf, std::vector<std::wstring>& out) {
+    std::string run;
+    for (std::size_t i = 0; i <= buf.size(); ++i) {
+        const int c = i < buf.size() ? buf[i] : -1;
+        if (c >= 0x20 && c <= 0x7e) run.push_back(static_cast<char>(c));
+        else { if (run.size() >= 4) out.push_back(wide(run)); run.clear(); }
+    }
+    std::wstring wrun;
+    for (std::size_t i = 0; i + 1 < buf.size(); i += 2) {
+        const int c = buf[i]; const int hi = buf[i + 1];
+        if (hi == 0 && c >= 0x20 && c <= 0x7e) wrun.push_back(static_cast<wchar_t>(c));
+        else { if (wrun.size() >= 4) out.push_back(wrun); wrun.clear(); }
+    }
+    if (wrun.size() >= 4) out.push_back(wrun);
+}
+
+void emulate_decryptor(HWND window) {
+    if (!g_database || !g_current_address) { MessageBoxW(window, L"Выбери функцию-декриптор.", L"Emulate Decryptor", MB_ICONINFORMATION); return; }
+    gandon::Emulator emu(g_database->image());
+    if (!emu.ready()) { MessageBoxW(window, wide(emu.error()).c_str(), L"Emulate Decryptor", MB_ICONWARNING); return; }
+    std::string err;
+    const char* pc = g_database->image().architecture == gandon::MachineArchitecture::ARM64 ? "PC" : g_database->image().is_64_bit ? "RIP" : "EIP";
+    emu.set_register(pc, g_current_address, err);
+    const auto result = emu.run(200'000, 2'000'000);
+    std::map<std::uint64_t, std::uint8_t> written;
+    for (const auto& a : emu.memory_accesses()) {
+        if (!a.write || !a.value_captured || a.size == 0 || a.size > 8) continue;
+        for (std::uint32_t k = 0; k < a.size; ++k) written[a.address + k] = static_cast<std::uint8_t>(a.value >> (8 * k));
+    }
+    // Rebuild contiguous regions from the sparse write map and scan each for strings.
+    std::vector<std::wstring> strings;
+    std::vector<std::uint8_t> region; std::uint64_t prev = 0; bool have = false;
+    for (const auto& [addr, byte] : written) {
+        if (have && addr != prev + 1) { extract_strings(region, strings); region.clear(); }
+        region.push_back(byte); prev = addr; have = true;
+    }
+    if (!region.empty()) extract_strings(region, strings);
+    std::sort(strings.begin(), strings.end());
+    strings.erase(std::unique(strings.begin(), strings.end()), strings.end());
+
+    std::wostringstream r;
+    r << L"Decryptor emulation @ 0x" << std::hex << std::uppercase << g_current_address << L"\r\n";
+    r << L"instructions executed: " << std::dec << result.instructions_executed
+      << L", memory writes: " << written.size() << L"\r\n\r\n";
+    if (strings.empty()) r << L"Строк не восстановлено. Возможно, декриптору нужны аргументы (поставь RCX/RDX на зашифрованные данные через эмулятор) или мешает защита.\r\n";
+    else { r << L"Recovered strings (" << std::dec << strings.size() << L"):\r\n"; for (const auto& s : strings) r << L"  " << s << L"\r\n"; }
+    g_listing = r.str(); select_view(window, 1);
+    SetWindowTextW(g_status, strings.empty() ? L"Decryptor: no strings recovered." : (std::to_wstring(strings.size()) + L" string(s) recovered.").c_str());
 }
 
 void prepare_emulation_session(HWND window) {
@@ -8124,6 +8663,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         AppendMenuW(edit, MF_STRING, ID_STRUCT_OFFSET, L"Structure Offset...\tT"); AppendMenuW(edit, MF_STRING, ID_ENUM_OPERAND, L"Enum Constant...\tM");
         AppendMenuW(edit, MF_STRING, ID_SET_PROTOTYPE, L"Function Prototype...\tY"); AppendMenuW(edit, MF_STRING, ID_TYPES_EDITOR, L"Local Types Editor...\tShift+F1");
         AppendMenuW(edit, MF_STRING, ID_NOP_BLOCK, L"NOP Current Block\tCtrl+F2"); AppendMenuW(edit, MF_STRING, ID_EDIT_INSTRUCTION, L"Edit Instruction\tCtrl+E");
+        AppendMenuW(edit, MF_POPUP, reinterpret_cast<UINT_PTR>(build_patch_submenu()), L"Patch Branch / Stub");
         AppendMenuW(edit, MF_STRING, ID_UNDO_PATCH, L"Undo Patch\tCtrl+Z"); AppendMenuW(edit, MF_STRING, ID_REDO_PATCH, L"Redo Patch\tCtrl+Y");
         HMENU jump = CreatePopupMenu();
         AppendMenuW(jump, MF_STRING, ID_JUMP_ADDR, L"Jump to Address / Label...\tCtrl+G");
@@ -8144,6 +8684,12 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         AppendMenuW(tools, MF_STRING | MF_UNCHECKED, ID_TRACE_TOGGLE, L"Trace Debug Events");
         AppendMenuW(tools, MF_STRING, ID_EXPORT_TRACE, L"Export Trace...");
         AppendMenuW(tools, MF_STRING, ID_SEARCH_PROCESS_MEMORY, L"Search Process Memory...");
+        AppendMenuW(tools, MF_STRING, ID_POINTER_SCAN, L"Pointer Scan (Live Process)...");
+        AppendMenuW(tools, MF_STRING, ID_POINTER_RESCAN, L"Re-scan Pointer Chains...");
+        AppendMenuW(tools, MF_STRING, ID_STRUCT_DUMP, L"Dump Live Structure...");
+        AppendMenuW(tools, MF_STRING, ID_LIVE_EXPORT, L"Export Live Result...");
+        AppendMenuW(tools, MF_STRING, ID_LIVE_CANCEL, L"Cancel Live Operation");
+        AppendMenuW(tools, MF_STRING | MF_UNCHECKED, ID_KERNEL_BACKEND, L"Use Kernel Memory Reader (signed driver required)");
         AppendMenuW(tools, MF_STRING, ID_EMULATE_PREPARE, L"Prepare Emulation at Current Address...");
         AppendMenuW(tools, MF_STRING, ID_EMULATE, L"Run / Continue Emulation (Unicorn)...");
         AppendMenuW(tools, MF_STRING, ID_EMULATE_STEP, L"Step Emulation");
@@ -8166,9 +8712,19 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         AppendMenuW(tools, MF_STRING, ID_LLIL_RESET, L"Reset LLIL Emulator");
         AppendMenuW(tools, MF_STRING, ID_HIDDEN_SYMBOLS, L"Hidden Symbols...");
         AppendMenuW(tools, MF_STRING, ID_RESTORE_HIDDEN, L"Restore All Hidden Symbols");
+        AppendMenuW(tools, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(tools, MF_STRING, ID_DUMP_MODULE, L"Dump Unpacked Module + Rebuild IAT...");
+        AppendMenuW(tools, MF_STRING, ID_DETECT_VM, L"Detect VM Dispatcher / Flattening (current function)");
+        AppendMenuW(tools, MF_STRING, ID_TRACE_VM, L"Trace VM Handlers (emulate from current address)");
+        AppendMenuW(tools, MF_STRING, ID_DEVIRT_VM, L"Devirtualize VM Handlers (decompile)");
+        AppendMenuW(tools, MF_STRING, ID_EMULATE_DECRYPT, L"Emulate String Decryptor (current function)");
+        AppendMenuW(tools, MF_STRING, ID_ANALYZE_DOTNET, L"Analyze .NET Metadata");
+        AppendMenuW(tools, MF_STRING, ID_RECOVER_RTTI, L"Recover RTTI / C++ Classes");
+        AppendMenuW(tools, MF_STRING, ID_ANALYZE_DRIVER, L"Analyze Kernel Driver (IRP / IOCTL)");
         HMENU debugger = CreatePopupMenu();
         AppendMenuW(debugger, MF_STRING, ID_RUN, L"Start / Continue Process\tF9"); AppendMenuW(debugger, MF_STRING, ID_PAUSE, L"Pause Process\tF6"); AppendMenuW(debugger, MF_STRING, ID_STEP_INTO, L"Step Into\tF7"); AppendMenuW(debugger, MF_STRING, ID_STEP_OVER, L"Step Over\tF8");
-        AppendMenuW(debugger, MF_STRING, ID_ANTI_DEBUG, L"Hide Debugger (PEB BeingDebugged / NtGlobalFlag)");
+        AppendMenuW(debugger, MF_STRING, ID_ANTI_DEBUG, L"Anti-anti-debug: PEB flags (reversible)");
+        AppendMenuW(debugger, MF_STRING, ID_ANTIDEBUG_STATUS, L"Anti-anti-debug Status");
         AppendMenuW(debugger, MF_STRING, ID_TOGGLE_BP, L"Toggle Breakpoint\tF2"); AppendMenuW(debugger, MF_STRING, ID_COND_BP, L"Set Conditional Breakpoint..."); AppendMenuW(debugger, MF_STRING, ID_CONFIG_BP, L"Configure Breakpoint..."); AppendMenuW(debugger, MF_STRING, ID_BP_MANAGER, L"Breakpoint Manager...");
         AppendMenuW(debugger, MF_STRING, ID_HW_BP, L"Toggle Hardware Breakpoint"); AppendMenuW(debugger, MF_STRING, ID_DELETE_BP, L"Delete Selected Breakpoint\tDel"); AppendMenuW(debugger, MF_STRING, ID_STOP, L"Stop Process");
         HMENU view = CreatePopupMenu();
@@ -8347,6 +8903,29 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         if (invoke_native_plugin_action(window, id)) return 0;
         if (invoke_python_plugin_action(window, id)) return 0;
         if (dock::command(id)) return 0;
+        // Unpacking / protection analysis — handled up front to keep the large
+        // else-if chain below within the compiler's block-nesting limit.
+        if (id == ID_DUMP_MODULE) { dump_process_module(window); return 0; }
+        if (id == ID_DETECT_VM) { detect_vm_here(window); return 0; }
+        if (id == ID_TRACE_VM) { trace_vm_here(window); return 0; }
+        if (id == ID_DEVIRT_VM) { devirtualize_vm_here(window); return 0; }
+        if (id == ID_EMULATE_DECRYPT) { emulate_decryptor(window); return 0; }
+        if (id == ID_ANALYZE_DOTNET) { analyze_dotnet_here(window); return 0; }
+        if (id == ID_RECOVER_RTTI) { recover_rtti_here(window); return 0; }
+        if (id == ID_ANALYZE_DRIVER) { analyze_driver_here(window); return 0; }
+        // Live-memory commands use flat dispatch to avoid MSVC's nested-block limit.
+        if (id == ID_POINTER_SCAN) { live_pointer_scan(window, false); return 0; }
+        if (id == ID_POINTER_RESCAN) { live_pointer_scan(window, true); return 0; }
+        if (id == ID_STRUCT_DUMP) { live_structure_dump(window); return 0; }
+        if (id == ID_LIVE_EXPORT) { export_live_result(window); return 0; }
+        if (id == ID_LIVE_CANCEL) { g_live_cancel.store(true); SetWindowTextW(g_status, L"Cancellation requested."); return 0; }
+        if (id == ID_KERNEL_BACKEND) {
+            g_live_kernel = !g_live_kernel;
+            CheckMenuItem(GetMenu(window), ID_KERNEL_BACKEND, MF_BYCOMMAND | (g_live_kernel ? MF_CHECKED : MF_UNCHECKED));
+            SetWindowTextW(g_status, g_live_kernel ? L"New live operations use the kernel reader; normal process access rights still apply." : L"New live operations use ReadProcessMemory.");
+            return 0;
+        }
+        if (id == ID_ANTIDEBUG_STATUS) { show_antidebug_status(window); return 0; }
         if (id == ID_OPEN) open_binary(window);
         else if (id == ID_SAVE_DB) save_database(window);
         else if (id == ID_LOAD_DB) load_database(window);
@@ -8354,6 +8933,11 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         else if (id == ID_APPLY_PATCHES) apply_patches_to_file(window);
         else if (id == ID_NOP_BLOCK) nop_current_function(window);
         else if (id == ID_EDIT_INSTRUCTION) edit_instruction(window);
+        else if (id == ID_INVERT_BRANCH) invert_branch(window);
+        else if (id == ID_FORCE_BRANCH) force_branch(window);
+        else if (id == ID_NOP_BRANCH) never_branch(window);
+        else if (id == ID_STUB_RET0) stub_return(window, false);
+        else if (id == ID_STUB_RET1) stub_return(window, true);
         else if (id == ID_UNDO_PATCH) undo_patch(window);
         else if (id == ID_REDO_PATCH) redo_patch(window);
         else if (id == ID_EXPORT_GRAPH) export_graph_png(window);
@@ -8501,6 +9085,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             AppendMenuW(context, MF_STRING, ID_CONTEXT_FOLLOW, L"Follow Address");
             if (TabCtrl_GetCurSel(g_tabs) == 3 && editor_line_target_address(g_editor)) AppendMenuW(context, MF_STRING, ID_CONTEXT_FOLLOW_TARGET, L"Follow XREF Target");
             AppendMenuW(context, MF_STRING, ID_EDIT_INSTRUCTION, L"Patch Instruction...");
+            AppendMenuW(context, MF_POPUP, reinterpret_cast<UINT_PTR>(build_patch_submenu()), L"Patch");
             AppendMenuW(context, MF_STRING, ID_NOP_BLOCK, L"Patch Function (NOP)");
             AppendMenuW(context, MF_STRING, ID_RENAME_LABEL, L"Rename Label");
             AppendMenuW(context, MF_STRING, ID_ADD_COMMENT, L"Add Comment");
@@ -8773,6 +9358,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
     }
     case WM_ERASEBKGND: { RECT rect{}; GetClientRect(window, &rect); FillRect(reinterpret_cast<HDC>(wparam), &rect, g_background); return 1; }
     case WM_CLOSE: {
+        if (g_live_busy) { g_live_cancel.store(true); SetWindowTextW(g_status, L"Cancelling live operation. Close again after it completes."); return 0; }
+        if (g_live_worker.joinable()) g_live_worker.join();
         if (g_debug_process.load()) stop_debugger(window);
         if (g_database && g_session_dirty) {
             const auto choice = MessageBoxW(window, L"Сохранить рабочую сессию перед выходом?\r\nДа — сохранить .gnd и удалить backup.\r\nНет — удалить backup без сохранения.", L"Gandon-PRO", MB_YESNOCANCEL | MB_ICONQUESTION);
@@ -8795,6 +9382,19 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         DestroyWindow(window); return 0;
     }
     case WM_DESTROY: KillTimer(window, ID_SESSION_TIMER); PostQuitMessage(0); return 0;
+    case WM_LIVE_RESULT: {
+        std::unique_ptr<LiveTaskResult> result(reinterpret_cast<LiveTaskResult*>(lparam));
+        if (g_live_worker.joinable()) g_live_worker.join();
+        g_live_busy = false;
+        if (result) {
+            g_live_last_pid = result->pid; g_live_last_report = result->report;
+            if (result->scan) { g_live_last_scan = std::move(result->pointers); g_live_last_structure = {}; }
+            else g_live_last_structure = std::move(result->structure);
+            g_listing = wide(g_live_last_report); select_view(window, 1);
+            SetWindowTextW(g_status, g_live_cancel.load() ? L"Live operation cancelled; partial result shown." : L"Live operation completed; Tools > Export Live Result saves it.");
+        }
+        return 0;
+    }
     case WM_RUN_ON_UI: {
         // A plugin's background thread (e.g. the MCP server plugin) marshals a
         // job onto the UI thread this way: SendMessageW blocks the caller until
@@ -8834,7 +9434,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show_
     WNDCLASSW graph_class{}; graph_class.hInstance = instance; graph_class.lpfnWndProc = graph_proc; graph_class.lpszClassName = L"GandonGraphView"; graph_class.hCursor = LoadCursorW(nullptr, IDC_ARROW); graph_class.hbrBackground = g_panel; graph_class.style = CS_DBLCLKS; RegisterClassW(&graph_class);
     WNDCLASSW navband_class{}; navband_class.hInstance = instance; navband_class.lpfnWndProc = navband_proc; navband_class.lpszClassName = L"GandonNavBand"; navband_class.hCursor = LoadCursorW(nullptr, IDC_HAND); RegisterClassW(&navband_class);
     WNDCLASSW minimap_class{}; minimap_class.hInstance = instance; minimap_class.lpfnWndProc = minimap_proc; minimap_class.lpszClassName = L"GandonMiniMap"; minimap_class.hCursor = LoadCursorW(nullptr, IDC_CROSS); minimap_class.hbrBackground = g_panel; RegisterClassW(&minimap_class);
-    HWND window = CreateWindowExW(0, class_name, L"Gandon-PRO - Native Disassembler [ui build 27]", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS, CW_USEDEFAULT, CW_USEDEFAULT, 1400, 850, nullptr, nullptr, instance, nullptr); if (!window) return 1;
+    HWND window = CreateWindowExW(0, class_name, L"Gandon-PRO - Native Disassembler [ui build 32]", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS, CW_USEDEFAULT, CW_USEDEFAULT, 1400, 850, nullptr, nullptr, instance, nullptr); if (!window) return 1;
     g_main_window = window;
     if (g_small_icon) SendMessageW(window, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(g_small_icon));
     const BOOL dark = g_light_theme ? FALSE : TRUE;
@@ -8842,6 +9442,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show_
     const COLORREF caption = THEMED_RGB(30, 34, 40);
     DwmSetWindowAttribute(window, 35, &caption, sizeof(caption));
     ShowWindow(window, show_command); UpdateWindow(window);
+    g_live_kernel = gandon::offer_memory_driver_setup(window);
+    CheckMenuItem(GetMenu(window), ID_KERNEL_BACKEND, MF_BYCOMMAND | (g_live_kernel ? MF_CHECKED : MF_UNCHECKED));
+    SetWindowTextW(g_status, g_live_kernel ? L"Kernel memory reader connected." : L"Using ReadProcessMemory; driver is optional.");
     if (command_line && *command_line) {
         std::wstring argument(command_line);
         const auto first = argument.find_first_not_of(L" \t");
